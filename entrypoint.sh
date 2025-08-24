@@ -246,4 +246,4 @@ exec /app/pocketbase $ENCRYPTION_ARG \
   --dir /pb_data \
   --hooksDir /app/pb_hooks \
   --migrationsDir /pb_migrations \
-  serve --http 0.0.0.0:8090
+  serve --http 0.0.0.0:8090 
