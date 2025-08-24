@@ -5,19 +5,16 @@ set -euo pipefail
 # Required/optional env vars
 # --------------------------
 
-# --- Admin bootstrap (required for first run if no admin exists) ---
 : "${PB_ADMIN_EMAIL:?Set PB_ADMIN_EMAIL}"
 : "${PB_ADMIN_PASSWORD:?Set PB_ADMIN_PASSWORD}"
 
-# Optional: encrypt secrets stored in PB settings (recommended)
 PB_ENCRYPTION="${PB_ENCRYPTION:-}"
 ENCRYPTION_ARG=""
 [ -n "$PB_ENCRYPTION" ] && ENCRYPTION_ARG="--encryptionEnv PB_ENCRYPTION"
 
-# Public URL of your PB instance (for settings/meta & links)
 PB_PUBLIC_URL="${PB_PUBLIC_URL:-http://127.0.0.1:8090}"
 
-# --- S3 for FILE STORAGE (uploads) ---
+# S3 storage (uploads)
 PB_S3_STORAGE_ENABLED="${PB_S3_STORAGE_ENABLED:-true}"
 PB_S3_STORAGE_BUCKET="${PB_S3_STORAGE_BUCKET:-}"
 PB_S3_STORAGE_REGION="${PB_S3_STORAGE_REGION:-}"
@@ -26,7 +23,7 @@ PB_S3_STORAGE_ACCESS_KEY="${PB_S3_STORAGE_ACCESS_KEY:-}"
 PB_S3_STORAGE_SECRET="${PB_S3_STORAGE_SECRET:-}"
 PB_S3_STORAGE_FORCE_PATH_STYLE="${PB_S3_STORAGE_FORCE_PATH_STYLE:-false}"
 
-# --- S3 for BACKUPS (PocketBase scheduled backups) ---
+# S3 backups (scheduled by PB)
 PB_S3_BACKUPS_ENABLED="${PB_S3_BACKUPS_ENABLED:-true}"
 PB_S3_BACKUPS_BUCKET="${PB_S3_BACKUPS_BUCKET:-}"
 PB_S3_BACKUPS_REGION="${PB_S3_BACKUPS_REGION:-}"
@@ -37,20 +34,20 @@ PB_S3_BACKUPS_FORCE_PATH_STYLE="${PB_S3_BACKUPS_FORCE_PATH_STYLE:-false}"
 PB_BACKUPS_CRON="${PB_BACKUPS_CRON:-0 3 * * *}"
 PB_BACKUPS_MAX_KEEP="${PB_BACKUPS_MAX_KEEP:-7}"
 
-# --- First-boot restore from S3 backup ZIP (external bucket) ---
+# First-boot restore
 PB_RESTORE_FROM_S3="${PB_RESTORE_FROM_S3:-true}"
-PB_BACKUP_BUCKET_URL="${PB_BACKUP_BUCKET_URL:-}"    # e.g. s3://bucket or s3://bucket/prefix
+PB_BACKUP_BUCKET_URL="${PB_BACKUP_BUCKET_URL:-}"
 
-# AWS CLI creds/region for restore (you already set these)
+# AWS CLI creds for restore (Wasabi)
 AWS_REGION="${AWS_REGION:-us-east-1}"
 AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
 AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
+export AWS_REGION AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 
-# Ensure the AWS CLI hits Wasabi (or other S3-compatible) not AWS S3.
-# Prefer explicit AWS_S3_ENDPOINT; else fall back to PB_S3_BACKUPS_ENDPOINT; else PB_S3_STORAGE_ENDPOINT.
+# Ensure aws cli uses Wasabi (endpoint)
 AWS_S3_ENDPOINT="${AWS_S3_ENDPOINT:-}"
 if [ -z "$AWS_S3_ENDPOINT" ]; then
-  if [ -n "$PB_S3_BACKUPS_ENDPOINT" ]; then
+  if [ -n "${PB_S3_BACKUPS_ENDPOINT:-}" ]; then
     AWS_S3_ENDPOINT="$PB_S3_BACKUPS_ENDPOINT"
   else
     AWS_S3_ENDPOINT="$PB_S3_STORAGE_ENDPOINT"
@@ -61,20 +58,17 @@ fi
 # Paths & initial sync
 # --------------------------
 mkdir -p /pb_data /pb_migrations
-
-# Keep repo migrations in sync with runtime (no delete to preserve any runtime-generated files)
 if [ -d /app/pb_migrations ]; then
   rsync -a --update /app/pb_migrations/ /pb_migrations/
 fi
 
 # --------------------------
-# First-boot: auto-restore from S3 if data.db is missing
+# First-boot restore from S3
 # --------------------------
 if [ ! -f /pb_data/data.db ] && [ "$PB_RESTORE_FROM_S3" = "true" ] && [ -n "$PB_BACKUP_BUCKET_URL" ]; then
   echo "[restore] No data.db; attempting restore from $PB_BACKUP_BUCKET_URL"
-  export AWS_REGION AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+  apk add --no-cache aws-cli unzip >/dev/null 2>&1 || true
 
-  # List newest object in the given bucket/prefix using the proper endpoint
   LATEST_KEY="$(
     aws --endpoint-url "$AWS_S3_ENDPOINT" s3 ls "${PB_BACKUP_BUCKET_URL%/}/" \
     | awk '{print $4,$1,$2}' | sort -k2,3 | tail -n1 | awk '{print $1}'
@@ -84,7 +78,6 @@ if [ ! -f /pb_data/data.db ] && [ "$PB_RESTORE_FROM_S3" = "true" ] && [ -n "$PB_
     echo "[restore] Found backup: $LATEST_KEY"
     aws --endpoint-url "$AWS_S3_ENDPOINT" s3 cp \
       "${PB_BACKUP_BUCKET_URL%/}/${LATEST_KEY}" /tmp/pb_backup.zip
-    apk add --no-cache unzip >/dev/null 2>&1 || true
     unzip -o /tmp/pb_backup.zip -d /tmp/pb_restore
     if [ -d /tmp/pb_restore/pb_data ]; then
       cp -a /tmp/pb_restore/pb_data/. /pb_data/
@@ -108,10 +101,10 @@ if ! /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migratio
 fi
 
 # --------------------------
-# Headless Settings bootstrap (S3 storage + backups)
-# Start PB on a loopback port, configure via API, then stop it.
+# Bootstrap settings (S3 storage + backups) via API
 # --------------------------
 apk add --no-cache curl jq >/dev/null 2>&1 || true
+
 BOOT_PORT=8099
 echo "[bootstrap] Starting temporary PB on :${BOOT_PORT} for settings..."
 /app/pocketbase $ENCRYPTION_ARG \
@@ -121,29 +114,35 @@ echo "[bootstrap] Starting temporary PB on :${BOOT_PORT} for settings..."
   serve --http 127.0.0.1:${BOOT_PORT} >/tmp/pb_bootstrap.log 2>&1 &
 PB_PID=$!
 
-# Wait until health endpoint responds
-for i in $(seq 1 60); do
+# Wait for health
+for i in $(seq 1 80); do
   sleep 0.25
   if curl -fsS "http://127.0.0.1:${BOOT_PORT}/api/health" >/dev/null 2>&1; then break; fi
-  [ "$i" -eq 60 ] && echo "[bootstrap] PB failed to start" && cat /tmp/pb_bootstrap.log && exit 1
+  [ "$i" -eq 80 ] && echo "[bootstrap] PB failed to start" && cat /tmp/pb_bootstrap.log && exit 1
 done
 
-# Get admin token
-ADMIN_TOKEN="$(curl -fsS -X POST "http://127.0.0.1:${BOOT_PORT}/api/admins/auth-with-password" \
+# Admin token
+AUTH_RES="$(curl -sS -X POST "http://127.0.0.1:${BOOT_PORT}/api/admins/auth-with-password" \
   -H "Content-Type: application/json" \
-  -d "{\"identity\":\"$PB_ADMIN_EMAIL\",\"password\":\"$PB_ADMIN_PASSWORD\"}" \
-  | jq -r .token)"
-
+  -d "{\"identity\":\"$PB_ADMIN_EMAIL\",\"password\":\"$PB_ADMIN_PASSWORD\"}")"
+ADMIN_TOKEN="$(echo "$AUTH_RES" | jq -r .token)"
 if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
   echo "[bootstrap] Failed to obtain admin token"
+  echo "$AUTH_RES" | sed 's/\"password\":\"[^"]*\"/\"password\":\"***\"/'
   cat /tmp/pb_bootstrap.log || true
   kill $PB_PID; wait $PB_PID 2>/dev/null || true
   exit 1
 fi
 
-# Build JSON for S3 storage & backups
+# Build settings JSON – only include sections if all required fields are present
+SETTINGS_META="$(jq -n --arg url "$PB_PUBLIC_URL" '{meta:{appName:"PocketBase",appUrl:$url}}')"
+
+# Storage
 STORAGE_JSON="{}"
-if [ "$PB_S3_STORAGE_ENABLED" = "true" ]; then
+if [ "$PB_S3_STORAGE_ENABLED" = "true" ] \
+   && [ -n "$PB_S3_STORAGE_BUCKET" ] && [ -n "$PB_S3_STORAGE_REGION" ] \
+   && [ -n "$PB_S3_STORAGE_ENDPOINT" ] && [ -n "$PB_S3_STORAGE_ACCESS_KEY" ] \
+   && [ -n "$PB_S3_STORAGE_SECRET" ]; then
   STORAGE_JSON="$(jq -n \
     --arg b  "$PB_S3_STORAGE_BUCKET" \
     --arg r  "$PB_S3_STORAGE_REGION" \
@@ -154,8 +153,12 @@ if [ "$PB_S3_STORAGE_ENABLED" = "true" ]; then
     '{enabled:true,bucket:$b,region:$r,endpoint:$e,accessKey:$ak,secret:$sk,forcePathStyle:$fps}')"
 fi
 
+# Backups
 BACKUPS_JSON="{}"
-if [ "$PB_S3_BACKUPS_ENABLED" = "true" ]; then
+if [ "$PB_S3_BACKUPS_ENABLED" = "true" ] \
+   && [ -n "$PB_S3_BACKUPS_BUCKET" ] && [ -n "$PB_S3_BACKUPS_REGION" ] \
+   && [ -n "$PB_S3_BACKUPS_ENDPOINT" ] && [ -n "$PB_S3_BACKUPS_ACCESS_KEY" ] \
+   && [ -n "$PB_S3_BACKUPS_SECRET" ] && [ -n "$PB_BACKUPS_CRON" ] && [ -n "$PB_BACKUPS_MAX_KEEP" ]; then
   BACKUPS_S3="$(jq -n \
     --arg b  "$PB_S3_BACKUPS_BUCKET" \
     --arg r  "$PB_S3_BACKUPS_REGION" \
@@ -171,31 +174,41 @@ if [ "$PB_S3_BACKUPS_ENABLED" = "true" ]; then
     '{cron:$cron,cronMaxKeep:($keep|tonumber),s3:($s3|fromjson)}')"
 fi
 
+# Merge payload
 SETTINGS_BODY="$(jq -n \
-  --arg url "$PB_PUBLIC_URL" \
-  --argjson s3 "${STORAGE_JSON}" \
-  --argjson backups "${BACKUPS_JSON}" \
-  '{meta:{appName:"PocketBase",appUrl:$url},
-    s3:$s3,
-    backups:$backups
-  }')"
+  --argjson meta "$SETTINGS_META" \
+  --argjson s3   "$STORAGE_JSON" \
+  --argjson b    "$BACKUPS_JSON" \
+  '$meta + ( ( $s3|type == "object" and ($s3|length>0) ) ? {s3:$s3} : {} ) + ( ( $b|type=="object" and ($b|length>0)) ? {backups:$b} : {} )')"
 
-# PATCH /api/settings
-echo "$SETTINGS_BODY" | curl -fsS -X PATCH "http://127.0.0.1:${BOOT_PORT}/api/settings" \
-  -H "Authorization: $ADMIN_TOKEN" \
+# PATCH /api/settings (with Bearer token)
+PATCH_OUT="$(mktemp)"
+PATCH_CODE=0
+echo "$SETTINGS_BODY" | curl -sS -w "%{http_code}" -o "$PATCH_OUT" \
+  -X PATCH "http://127.0.0.1:${BOOT_PORT}/api/settings" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  --data-binary @- >/dev/null
+  --data-binary @- > /tmp/pb_patch_code.txt || PATCH_CODE=$?
+
+HTTP_CODE="$(cat /tmp/pb_patch_code.txt || echo 000)"
+if [ "$PATCH_CODE" -ne 0 ] || [ "$HTTP_CODE" -ge 400 ]; then
+  echo "[bootstrap] Settings PATCH failed (HTTP $HTTP_CODE). Response:"
+  cat "$PATCH_OUT"
+  cat /tmp/pb_bootstrap.log || true
+  kill $PB_PID; wait $PB_PID 2>/dev/null || true
+  exit 1
+fi
+rm -f "$PATCH_OUT" /tmp/pb_patch_code.txt
 
 # Test S3 connections (optional)
-if [ "$PB_S3_STORAGE_ENABLED" = "true" ]; then
+if [ "$PB_S3_STORAGE_ENABLED" = "true" ] && [ -n "$PB_S3_STORAGE_BUCKET" ]; then
   curl -fsS -X POST "http://127.0.0.1:${BOOT_PORT}/api/settings/test/s3" \
-    -H "Authorization: $ADMIN_TOKEN" -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
     -d '{"filesystem":"storage"}' >/dev/null || true
 fi
-
-if [ "$PB_S3_BACKUPS_ENABLED" = "true" ]; then
+if [ "$PB_S3_BACKUPS_ENABLED" = "true" ] && [ -n "$PB_S3_BACKUPS_BUCKET" ]; then
   curl -fsS -X POST "http://127.0.0.1:${BOOT_PORT}/api/settings/test/s3" \
-    -H "Authorization: $ADMIN_TOKEN" -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
     -d '{"filesystem":"backups"}' >/dev/null || true
 fi
 
