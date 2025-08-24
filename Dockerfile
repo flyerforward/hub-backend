@@ -15,7 +15,7 @@ RUN curl -L -o pb.zip \
 
 # App files
 COPY pb_hooks/            /app/pb_hooks/
-COPY pb_migrations_seed/  /app/pb_migrations_seed/
+COPY pb_migrations/  /app/work/pb_migrations/
 COPY entrypoint.sh        /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
