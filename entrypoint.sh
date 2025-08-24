@@ -1,9 +1,11 @@
 #!/usr/bin/env sh
 set -euo pipefail
 
-echo "[boot] entrypoint v6 loaded"
+echo "[boot] entrypoint v7 loaded"
 
-# ========= ENV =========
+############################################
+# Env (same as before)
+############################################
 : "${PB_ADMIN_EMAIL:?Set PB_ADMIN_EMAIL}"
 : "${PB_ADMIN_PASSWORD:?Set PB_ADMIN_PASSWORD}"
 
@@ -49,16 +51,19 @@ if [ -z "$AWS_S3_ENDPOINT" ]; then
   fi
 fi
 
-# ========= TOOLS =========
+############################################
+# Tools & dirs
+############################################
 apk add --no-cache aws-cli unzip curl jq rsync >/dev/null 2>&1 || true
 
-# ========= DIRS =========
 mkdir -p /pb_data /pb_migrations
 if [ -d /app/pb_migrations ]; then
   rsync -a --update /app/pb_migrations/ /pb_migrations/
 fi
 
-# ========= RESTORE =========
+############################################
+# First boot: restore from Wasabi (if empty)
+############################################
 if [ ! -f /pb_data/data.db ] && [ "$PB_RESTORE_FROM_S3" = "true" ] && [ -n "$PB_BACKUP_BUCKET_URL" ]; then
   echo "[restore] No data.db; attempting restore from $PB_BACKUP_BUCKET_URL"
   LATEST_KEY="$(
@@ -82,22 +87,53 @@ if [ ! -f /pb_data/data.db ] && [ "$PB_RESTORE_FROM_S3" = "true" ] && [ -n "$PB_
   fi
 fi
 
-# ========= ADMIN BOOTSTRAP =========
+############################################
+# *** CRITICAL *** Initialize core + migrations
+# Start PB once so it creates core tables and applies user migrations.
+############################################
+INIT_PORT=8097
+echo "[init] Starting PB once on :${INIT_PORT} to initialize core/migrations…"
+/app/pocketbase $ENCRYPTION_ARG \
+  --dev \
+  --dir /pb_data \
+  --hooksDir /app/pb_hooks \
+  --migrationsDir /pb_migrations \
+  serve --http 127.0.0.1:${INIT_PORT} >/tmp/pb_init.log 2>&1 &
+INIT_PID=$!
+
+# wait until healthy, then give it a moment to finish init
+for i in $(seq 1 120); do
+  sleep 0.25
+  if curl -fsS "http://127.0.0.1:${INIT_PORT}/api/health" >/dev/null 2>&1; then
+    sleep 0.5
+    break
+  fi
+  [ "$i" -eq 120 ] && echo "[init] PB failed to start" && cat /tmp/pb_init.log && exit 1
+done
+kill $INIT_PID
+wait $INIT_PID 2>/dev/null || true
+echo "[init] Core/migrations initialized."
+
+############################################
+# Ensure admin exists (idempotent) and force password
+############################################
 echo "[admin] Creating admin (idempotent) for ${PB_ADMIN_EMAIL}"
 CREATE_OUT=$(/app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
   admin create "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" 2>&1) || true
 echo "[admin] create output:"
 echo "$CREATE_OUT"
 
-echo "[admin] Forcing password update to ensure known credentials"
-UPDATE_OUT=$(/app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-  admin update "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" 2>&1) || true
+echo "[admin] Forcing password update"
+/app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
+  admin update "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_update.log 2>&1 || true
 echo "[admin] update output:"
-echo "$UPDATE_OUT"
+cat /tmp/pb_admin_update.log || true
 
-# ========= TEMP SERVER (DEV MODE) =========
+############################################
+# Bootstrap settings (S3 storage + backups) via API
+############################################
 BOOT_PORT=8099
-echo "[bootstrap] Starting temporary PB (dev mode) on :${BOOT_PORT} …"
+echo "[bootstrap] Starting temporary PB on :${BOOT_PORT} for settings…"
 /app/pocketbase $ENCRYPTION_ARG \
   --dev \
   --dir /pb_data \
@@ -109,28 +145,16 @@ PB_PID=$!
 for i in $(seq 1 120); do
   sleep 0.25
   if curl -fsS "http://127.0.0.1:${BOOT_PORT}/api/health" >/dev/null 2>&1; then break; fi
-  [ "$i" -eq 120 ] && echo "[bootstrap] PB failed to start" && cat /tmp/pb_bootstrap.log && exit 1
+  [ "$i" -eq 120 ] && echo "[bootstrap] PB failed to start" && tail -n 200 /tmp/pb_bootstrap.log && exit 1
 done
 
-# ========= AUTH (build JSON with jq) =========
 AUTH_BODY="$(jq -n --arg id "$PB_ADMIN_EMAIL" --arg pw "$PB_ADMIN_PASSWORD" '{identity:$id, password:$pw}')"
-
-AUTH_JSON=""
-ADMIN_TOKEN=""
-for i in $(seq 1 20); do
-  AUTH_JSON="$(curl -sS -X POST "http://127.0.0.1:${BOOT_PORT}/api/admins/auth-with-password" \
-    -H "Content-Type: application/json" \
-    --data-binary "$AUTH_BODY" || true)"
-  ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
-  if [ -n "$ADMIN_TOKEN" ] && [ "$ADMIN_TOKEN" != "null" ]; then
-    break
-  fi
-  echo "[bootstrap] Admin auth attempt $i failed; retrying…"
-  sleep 0.5
-done
+AUTH_JSON="$(curl -sS -X POST "http://127.0.0.1:${BOOT_PORT}/api/admins/auth-with-password" \
+  -H "Content-Type: application/json" --data-binary "$AUTH_BODY" || true)"
+ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
 
 if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
-  echo "[bootstrap] Failed to obtain admin token. Last response:"
+  echo "[bootstrap] Failed to obtain admin token. Response:"
   echo "$AUTH_JSON" | sed 's/"password":"[^"]*"/"password":"***"/'
   echo "--- bootstrap.log (tail) ---"
   tail -n 200 /tmp/pb_bootstrap.log || true
@@ -138,7 +162,7 @@ if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
   exit 1
 fi
 
-# ========= SETTINGS PAYLOAD =========
+# Build settings JSON pieces only if fully provided
 META_JSON="$(jq -n --arg url "$PB_PUBLIC_URL" '{meta:{appName:"PocketBase",appUrl:$url}}')"
 
 STOR_JSON="{}"
@@ -182,7 +206,6 @@ SETTINGS_BODY="$(jq -n \
   --argjson b    "$BACK_JSON" \
   '$meta + ( ( $s3|type=="object" and ($s3|length>0) ) ? {s3:$s3} : {} ) + ( ( $b|type=="object" and ($b|length>0)) ? {backups:$b} : {} )')"
 
-# ========= PATCH SETTINGS =========
 PATCH_OUT="$(mktemp)"
 PATCH_CODE=0
 echo "$SETTINGS_BODY" | curl -sS -w "%{http_code}" -o "$PATCH_OUT" \
@@ -214,12 +237,14 @@ if [ "$PB_S3_BACKUPS_ENABLED" = "true" ] && [ -n "$PB_S3_BACKUPS_BUCKET" ]; then
     -d '{"filesystem":"backups"}' >/dev/null || true
 fi
 
-# ========= STOP TEMP SERVER =========
+# Stop temp PB
 kill $PB_PID
 wait $PB_PID 2>/dev/null || true
 echo "[bootstrap] Settings configured."
 
-# ========= START REAL SERVER =========
+############################################
+# Start the real server
+############################################
 exec /app/pocketbase $ENCRYPTION_ARG \
   --dir /pb_data \
   --hooksDir /app/pb_hooks \
