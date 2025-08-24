@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -e
 
-# Create writable runtime dirs (these are volumes in Dokploy)
+# Create writable runtime dirs (these are volumes in Dokploy) 
 mkdir -p /work/pb_migrations /pb_data
 
 # Seed runtime migrations once from the image
