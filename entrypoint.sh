@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -euo pipefail
 
-echo "[boot] entrypoint v4 loaded"
+echo "[boot] entrypoint v5 loaded"
 
 ############################################
 # Required/optional env vars
@@ -18,6 +18,8 @@ ENCRYPTION_ARG=""
 
 # Public URL stored in settings.meta.appUrl (NO trailing slash)
 PB_PUBLIC_URL="${PB_PUBLIC_URL:-http://127.0.0.1:8090}"
+# strip trailing slash if present
+PB_PUBLIC_URL="${PB_PUBLIC_URL%/}"
 
 # --- S3 storage (uploads) ---
 PB_S3_STORAGE_ENABLED="${PB_S3_STORAGE_ENABLED:-true}"
@@ -60,6 +62,11 @@ if [ -z "$AWS_S3_ENDPOINT" ]; then
 fi
 
 ############################################
+# Tools we rely on
+############################################
+apk add --no-cache aws-cli unzip curl jq rsync >/dev/null 2>&1 || true
+
+############################################
 # Paths & initial sync
 ############################################
 mkdir -p /pb_data /pb_migrations
@@ -74,7 +81,6 @@ fi
 ############################################
 if [ ! -f /pb_data/data.db ] && [ "$PB_RESTORE_FROM_S3" = "true" ] && [ -n "$PB_BACKUP_BUCKET_URL" ]; then
   echo "[restore] No data.db; attempting restore from $PB_BACKUP_BUCKET_URL"
-  apk add --no-cache aws-cli unzip >/dev/null 2>&1 || true
 
   # Find newest object (by listing and sorting)
   LATEST_KEY="$(
@@ -112,11 +118,13 @@ else
   echo "[admin] Admin created (or already present)."
 fi
 
+# Log admin list so we can verify presence
+echo "[admin] Current admins:"
+/app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations admin list || true
+
 ############################################
 # Bootstrap settings (S3 storage + backups) via API
 ############################################
-apk add --no-cache curl jq >/dev/null 2>&1 || true
-
 BOOT_PORT=8099
 echo "[bootstrap] Starting temporary PB on :${BOOT_PORT} for settings..."
 /app/pocketbase $ENCRYPTION_ARG \
@@ -133,13 +141,16 @@ for i in $(seq 1 80); do
   [ "$i" -eq 80 ] && echo "[bootstrap] PB failed to start" && cat /tmp/pb_bootstrap.log && exit 1
 done
 
+# Build auth JSON with jq (no quoting issues)
+AUTH_BODY="$(jq -n --arg id "$PB_ADMIN_EMAIL" --arg pw "$PB_ADMIN_PASSWORD" '{identity:$id, password:$pw}')"
+
 # Try to get admin token (with retries)
 AUTH_JSON=""
 ADMIN_TOKEN=""
-for i in $(seq 1 10); do
+for i in $(seq 1 12); do
   AUTH_JSON="$(curl -sS -X POST "http://127.0.0.1:${BOOT_PORT}/api/admins/auth-with-password" \
     -H "Content-Type: application/json" \
-    -d "{\"identity\":\"$PB_ADMIN_EMAIL\",\"password\":\"$PB_ADMIN_PASSWORD\"}")" || AUTH_JSON=""
+    --data-binary "$AUTH_BODY")" || AUTH_JSON=""
   ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
   if [ -n "$ADMIN_TOKEN" ] && [ "$ADMIN_TOKEN" != "null" ]; then
     break
@@ -151,6 +162,7 @@ done
 if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
   echo "[bootstrap] Failed to obtain admin token after retries. Last response:"
   echo "$AUTH_JSON" | sed 's/"password":"[^"]*"/"password":"***"/'
+  echo "--- bootstrap.log ---"
   cat /tmp/pb_bootstrap.log || true
   kill $PB_PID
   wait $PB_PID 2>/dev/null || true
@@ -215,6 +227,7 @@ HTTP_CODE="$(cat /tmp/pb_patch_code.txt || echo 000)"
 if [ "$PATCH_CODE" -ne 0 ] || [ "$HTTP_CODE" -ge 400 ]; then
   echo "[bootstrap] Settings PATCH failed (HTTP $HTTP_CODE). Response:"
   cat "$PATCH_OUT"
+  echo "--- bootstrap.log ---"
   cat /tmp/pb_bootstrap.log || true
   kill $PB_PID
   wait $PB_PID 2>/dev/null || true
@@ -246,4 +259,4 @@ exec /app/pocketbase $ENCRYPTION_ARG \
   --dir /pb_data \
   --hooksDir /app/pb_hooks \
   --migrationsDir /pb_migrations \
-  serve --http 0.0.0.0:8090 
+  serve --http 0.0.0.0:8090
