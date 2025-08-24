@@ -1,10 +1,10 @@
 #!/usr/bin/env sh
 set -euo pipefail
 
-echo "[boot] entrypoint v7.1 loaded" 
+echo "[boot] entrypoint v7.2 loaded"
 
 ############################################
-# Env (same as before)
+# Env
 ############################################
 : "${PB_ADMIN_EMAIL:?Set PB_ADMIN_EMAIL}"
 : "${PB_ADMIN_PASSWORD:?Set PB_ADMIN_PASSWORD}"
@@ -16,6 +16,7 @@ ENCRYPTION_ARG=""
 PB_PUBLIC_URL="${PB_PUBLIC_URL:-http://127.0.0.1:8090}"
 PB_PUBLIC_URL="${PB_PUBLIC_URL%/}"
 
+# S3 storage (uploads)
 PB_S3_STORAGE_ENABLED="${PB_S3_STORAGE_ENABLED:-true}"
 PB_S3_STORAGE_BUCKET="${PB_S3_STORAGE_BUCKET:-}"
 PB_S3_STORAGE_REGION="${PB_S3_STORAGE_REGION:-}"
@@ -24,6 +25,7 @@ PB_S3_STORAGE_ACCESS_KEY="${PB_S3_STORAGE_ACCESS_KEY:-}"
 PB_S3_STORAGE_SECRET="${PB_S3_STORAGE_SECRET:-}"
 PB_S3_STORAGE_FORCE_PATH_STYLE="${PB_S3_STORAGE_FORCE_PATH_STYLE:-false}"
 
+# S3 backups (scheduled by PB)
 PB_S3_BACKUPS_ENABLED="${PB_S3_BACKUPS_ENABLED:-true}"
 PB_S3_BACKUPS_BUCKET="${PB_S3_BACKUPS_BUCKET:-}"
 PB_S3_BACKUPS_REGION="${PB_S3_BACKUPS_REGION:-}"
@@ -34,9 +36,11 @@ PB_S3_BACKUPS_FORCE_PATH_STYLE="${PB_S3_BACKUPS_FORCE_PATH_STYLE:-false}"
 PB_BACKUPS_CRON="${PB_BACKUPS_CRON:-0 3 * * *}"
 PB_BACKUPS_MAX_KEEP="${PB_BACKUPS_MAX_KEEP:-7}"
 
+# Restore from S3 (first boot)
 PB_RESTORE_FROM_S3="${PB_RESTORE_FROM_S3:-true}"
 PB_BACKUP_BUCKET_URL="${PB_BACKUP_BUCKET_URL:-}"
 
+# AWS CLI (Wasabi)
 AWS_REGION="${AWS_REGION:-us-east-1}"
 AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
 AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
@@ -57,9 +61,7 @@ fi
 apk add --no-cache aws-cli unzip curl jq rsync >/dev/null 2>&1 || true
 
 mkdir -p /pb_data /pb_migrations
-if [ -d /app/pb_migrations ]; then
-  rsync -a --update /app/pb_migrations/ /pb_migrations/
-fi
+[ -d /app/pb_migrations ] && rsync -a --update /app/pb_migrations/ /pb_migrations/
 
 ############################################
 # First boot: restore from Wasabi (if empty)
@@ -88,7 +90,7 @@ if [ ! -f /pb_data/data.db ] && [ "$PB_RESTORE_FROM_S3" = "true" ] && [ -n "$PB_
 fi
 
 ############################################
-# Initialize core + migrations
+# Initialize core + migrations (one-time)
 ############################################
 INIT_PORT=8097
 echo "[init] Starting PB once on :${INIT_PORT} to initialize core/migrations…"
@@ -116,16 +118,14 @@ echo "[init] Core/migrations initialized."
 # Ensure admin exists + force password
 ############################################
 echo "[admin] Creating admin (idempotent) for ${PB_ADMIN_EMAIL}"
-CREATE_OUT=$(/app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-  admin create "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" 2>&1) || true
-echo "[admin] create output:"
-echo "$CREATE_OUT"
+/app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
+  admin create "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_create.log 2>&1 || true
+echo "[admin] create output:"; cat /tmp/pb_admin_create.log || true
 
 echo "[admin] Forcing password update"
 /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
   admin update "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_update.log 2>&1 || true
-echo "[admin] update output:"
-cat /tmp/pb_admin_update.log || true
+echo "[admin] update output:"; cat /tmp/pb_admin_update.log || true
 
 ############################################
 # Bootstrap settings (S3 storage + backups) via API
@@ -146,70 +146,68 @@ for i in $(seq 1 120); do
   [ "$i" -eq 120 ] && echo "[bootstrap] PB failed to start" && tail -n 200 /tmp/pb_bootstrap.log && exit 1
 done
 
-# Auth via JSON built with jq (no quoting issues)
+# Auth
 AUTH_BODY="$(jq -n --arg id "$PB_ADMIN_EMAIL" --arg pw "$PB_ADMIN_PASSWORD" '{identity:$id, password:$pw}')"
 AUTH_JSON="$(curl -sS -X POST "http://127.0.0.1:${BOOT_PORT}/api/admins/auth-with-password" \
   -H "Content-Type: application/json" --data-binary "$AUTH_BODY" || true)"
 ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
-
 if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
   echo "[bootstrap] Failed to obtain admin token. Response:"
   echo "$AUTH_JSON" | sed 's/"password":"[^"]*"/"password":"***"/'
-  echo "--- bootstrap.log (tail) ---"
-  tail -n 200 /tmp/pb_bootstrap.log || true
+  echo "--- bootstrap.log (tail) ---"; tail -n 200 /tmp/pb_bootstrap.log || true
   kill $PB_PID; wait $PB_PID 2>/dev/null || true
   exit 1
 fi
 
-# Build settings JSON sections
-META_JSON="$(jq -n --arg url "$PB_PUBLIC_URL" '{meta:{appName:"PocketBase",appUrl:$url}}')"
+# ---------- Build JSON to files (avoid quoting headaches) ----------
+META_FILE="$(mktemp)"; echo "$(jq -n --arg url "$PB_PUBLIC_URL" '{meta:{appName:"PocketBase",appUrl:$url}}')" > "$META_FILE"
 
-STOR_JSON="{}"
+STOR_FILE="$(mktemp)"
 if [ "$PB_S3_STORAGE_ENABLED" = "true" ] \
    && [ -n "$PB_S3_STORAGE_BUCKET" ] && [ -n "$PB_S3_STORAGE_REGION" ] \
    && [ -n "$PB_S3_STORAGE_ENDPOINT" ] && [ -n "$PB_S3_STORAGE_ACCESS_KEY" ] \
    && [ -n "$PB_S3_STORAGE_SECRET" ]; then
-  STOR_JSON="$(jq -n \
+  jq -n \
     --arg b  "$PB_S3_STORAGE_BUCKET" \
     --arg r  "$PB_S3_STORAGE_REGION" \
     --arg e  "$PB_S3_STORAGE_ENDPOINT" \
     --arg ak "$PB_S3_STORAGE_ACCESS_KEY" \
     --arg sk "$PB_S3_STORAGE_SECRET" \
     --argjson fps "$PB_S3_STORAGE_FORCE_PATH_STYLE" \
-    '{enabled:true,bucket:$b,region:$r,endpoint:$e,accessKey:$ak,secret:$sk,forcePathStyle:$fps}')"
+    '{enabled:true,bucket:$b,region:$r,endpoint:$e,accessKey:$ak,secret:$sk,forcePathStyle:$fps}' > "$STOR_FILE"
+else
+  echo '{}' > "$STOR_FILE"
 fi
 
-BACK_JSON="{}"
+BACK_FILE="$(mktemp)"
 if [ "$PB_S3_BACKUPS_ENABLED" = "true" ] \
    && [ -n "$PB_S3_BACKUPS_BUCKET" ] && [ -n "$PB_S3_BACKUPS_REGION" ] \
    && [ -n "$PB_S3_BACKUPS_ENDPOINT" ] && [ -n "$PB_S3_BACKUPS_ACCESS_KEY" ] \
    && [ -n "$PB_S3_BACKUPS_SECRET" ] && [ -n "$PB_BACKUPS_CRON" ] && [ -n "$PB_BACKUPS_MAX_KEEP" ]; then
-  BACK_S3="$(jq -n \
+  jq -n \
+    --arg cron "$PB_BACKUPS_CRON" \
+    --argjson keep "$PB_BACKUPS_MAX_KEEP" \
     --arg b  "$PB_S3_BACKUPS_BUCKET" \
     --arg r  "$PB_S3_BACKUPS_REGION" \
     --arg e  "$PB_S3_BACKUPS_ENDPOINT" \
     --arg ak "$PB_S3_BACKUPS_ACCESS_KEY" \
     --arg sk "$PB_S3_BACKUPS_SECRET" \
     --argjson fps "$PB_S3_BACKUPS_FORCE_PATH_STYLE" \
-    '{enabled:true,bucket:$b,region:$r,endpoint:$e,accessKey:$ak,secret:$sk,forcePathStyle:$fps}')"
-  # FIX: don't use fromjson here; we already passed an object with --argjson
-  BACK_JSON="$(jq -n \
-    --arg cron "$PB_BACKUPS_CRON" \
-    --argjson keep "$PB_BACKUPS_MAX_KEEP" \
-    --argjson s3 "$BACK_S3" \
-    '{cron:$cron,cronMaxKeep:($keep|tonumber),s3:$s3}')"
+    '{cron:$cron,cronMaxKeep:($keep|tonumber),s3:{enabled:true,bucket:$b,region:$r,endpoint:$e,accessKey:$ak,secret:$sk,forcePathStyle:$fps}}' > "$BACK_FILE"
+else
+  echo '{}' > "$BACK_FILE"
 fi
 
-# Merge payload (both STOR_JSON and BACK_JSON are already JSON objects)
-SETTINGS_BODY="$(jq -n \
-  --argjson meta "$META_JSON" \
-  --argjson s3   "$STOR_JSON" \
-  --argjson b    "$BACK_JSON" \
-  '$meta + ( ( $s3|type=="object" and ($s3|length>0) ) ? {s3:$s3} : {} ) + ( ( $b|type=="object" and ($b|length>0)) ? {backups:$b} : {} )')"
+# Merge: meta + optional s3/backups
+SETTINGS_BODY="$(jq -s '
+  .[0] as $meta | .[1] as $s | .[2] as $b |
+  $meta
+  + ( ($s|type=="object" and ($s|keys|length>0)) ? {s3:$s} : {} )
+  + ( ($b|type=="object" and ($b|keys|length>0)) ? {backups:$b} : {} )
+' "$META_FILE" "$STOR_FILE" "$BACK_FILE")"
 
 # PATCH /api/settings
-PATCH_OUT="$(mktemp)"
-PATCH_CODE=0
+PATCH_OUT="$(mktemp)"; PATCH_CODE=0
 echo "$SETTINGS_BODY" | curl -sS -w "%{http_code}" -o "$PATCH_OUT" \
   -X PATCH "http://127.0.0.1:${BOOT_PORT}/api/settings" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
@@ -218,14 +216,12 @@ echo "$SETTINGS_BODY" | curl -sS -w "%{http_code}" -o "$PATCH_OUT" \
 
 HTTP_CODE="$(cat /tmp/pb_patch_code.txt || echo 000)"
 if [ "$PATCH_CODE" -ne 0 ] || [ "$HTTP_CODE" -ge 400 ]; then
-  echo "[bootstrap] Settings PATCH failed (HTTP $HTTP_CODE). Response:"
-  cat "$PATCH_OUT"
-  echo "--- bootstrap.log (tail) ---"
-  tail -n 200 /tmp/pb_bootstrap.log || true
+  echo "[bootstrap] Settings PATCH failed (HTTP $HTTP_CODE). Response:"; cat "$PATCH_OUT"
+  echo "--- bootstrap.log (tail) ---"; tail -n 200 /tmp/pb_bootstrap.log || true
   kill $PB_PID; wait $PB_PID 2>/dev/null || true
   exit 1
 fi
-rm -f "$PATCH_OUT" /tmp/pb_patch_code.txt
+rm -f "$PATCH_OUT" /tmp/pb_patch_code.txt "$META_FILE" "$STOR_FILE" "$BACK_FILE"
 
 # Optional connection tests
 if [ "$PB_S3_STORAGE_ENABLED" = "true" ] && [ -n "$PB_S3_STORAGE_BUCKET" ]; then
