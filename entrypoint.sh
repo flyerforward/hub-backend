@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -euo pipefail
 
-echo "[boot] entrypoint v7 loaded"
+echo "[boot] entrypoint v7.1 loaded"
 
 ############################################
 # Env (same as before)
@@ -88,8 +88,7 @@ if [ ! -f /pb_data/data.db ] && [ "$PB_RESTORE_FROM_S3" = "true" ] && [ -n "$PB_
 fi
 
 ############################################
-# *** CRITICAL *** Initialize core + migrations
-# Start PB once so it creates core tables and applies user migrations.
+# Initialize core + migrations
 ############################################
 INIT_PORT=8097
 echo "[init] Starting PB once on :${INIT_PORT} to initialize core/migrations…"
@@ -101,7 +100,6 @@ echo "[init] Starting PB once on :${INIT_PORT} to initialize core/migrations…"
   serve --http 127.0.0.1:${INIT_PORT} >/tmp/pb_init.log 2>&1 &
 INIT_PID=$!
 
-# wait until healthy, then give it a moment to finish init
 for i in $(seq 1 120); do
   sleep 0.25
   if curl -fsS "http://127.0.0.1:${INIT_PORT}/api/health" >/dev/null 2>&1; then
@@ -115,7 +113,7 @@ wait $INIT_PID 2>/dev/null || true
 echo "[init] Core/migrations initialized."
 
 ############################################
-# Ensure admin exists (idempotent) and force password
+# Ensure admin exists + force password
 ############################################
 echo "[admin] Creating admin (idempotent) for ${PB_ADMIN_EMAIL}"
 CREATE_OUT=$(/app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
@@ -148,6 +146,7 @@ for i in $(seq 1 120); do
   [ "$i" -eq 120 ] && echo "[bootstrap] PB failed to start" && tail -n 200 /tmp/pb_bootstrap.log && exit 1
 done
 
+# Auth via JSON built with jq (no quoting issues)
 AUTH_BODY="$(jq -n --arg id "$PB_ADMIN_EMAIL" --arg pw "$PB_ADMIN_PASSWORD" '{identity:$id, password:$pw}')"
 AUTH_JSON="$(curl -sS -X POST "http://127.0.0.1:${BOOT_PORT}/api/admins/auth-with-password" \
   -H "Content-Type: application/json" --data-binary "$AUTH_BODY" || true)"
@@ -162,7 +161,7 @@ if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
   exit 1
 fi
 
-# Build settings JSON pieces only if fully provided
+# Build settings JSON sections
 META_JSON="$(jq -n --arg url "$PB_PUBLIC_URL" '{meta:{appName:"PocketBase",appUrl:$url}}')"
 
 STOR_JSON="{}"
@@ -193,19 +192,22 @@ if [ "$PB_S3_BACKUPS_ENABLED" = "true" ] \
     --arg sk "$PB_S3_BACKUPS_SECRET" \
     --argjson fps "$PB_S3_BACKUPS_FORCE_PATH_STYLE" \
     '{enabled:true,bucket:$b,region:$r,endpoint:$e,accessKey:$ak,secret:$sk,forcePathStyle:$fps}')"
+  # FIX: don't use fromjson here; we already passed an object with --argjson
   BACK_JSON="$(jq -n \
     --arg cron "$PB_BACKUPS_CRON" \
     --argjson keep "$PB_BACKUPS_MAX_KEEP" \
     --argjson s3 "$BACK_S3" \
-    '{cron:$cron,cronMaxKeep:($keep|tonumber),s3:($s3|fromjson)}')"
+    '{cron:$cron,cronMaxKeep:($keep|tonumber),s3:$s3}')"
 fi
 
+# Merge payload (both STOR_JSON and BACK_JSON are already JSON objects)
 SETTINGS_BODY="$(jq -n \
   --argjson meta "$META_JSON" \
   --argjson s3   "$STOR_JSON" \
   --argjson b    "$BACK_JSON" \
   '$meta + ( ( $s3|type=="object" and ($s3|length>0) ) ? {s3:$s3} : {} ) + ( ( $b|type=="object" and ($b|length>0)) ? {backups:$b} : {} )')"
 
+# PATCH /api/settings
 PATCH_OUT="$(mktemp)"
 PATCH_CODE=0
 echo "$SETTINGS_BODY" | curl -sS -w "%{http_code}" -o "$PATCH_OUT" \
