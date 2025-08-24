@@ -6,7 +6,7 @@ mkdir -p /work/pb_migrations /pb_data
 
 # Seed runtime migrations once from the image
 if [ -z "$(ls -A /work/pb_migrations 2>/dev/null)" ] && [ -d /app/pb_migrations_seed ]; then
-  cp -a /app/pb_migrations_seed/. /work/pb_migrations/
+  cp -a /app/pb_migrations/. /work/pb_migrations/
 fi
 
 # Start PocketBase:
