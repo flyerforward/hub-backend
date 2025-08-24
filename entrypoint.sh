@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -euo pipefail
 
-echo "[boot] entrypoint v7.2 loaded"
+echo "[boot] entrypoint v7.3 loaded"
 
 ############################################
 # Env
@@ -159,8 +159,9 @@ if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
   exit 1
 fi
 
-# ---------- Build JSON to files (avoid quoting headaches) ----------
-META_FILE="$(mktemp)"; echo "$(jq -n --arg url "$PB_PUBLIC_URL" '{meta:{appName:"PocketBase",appUrl:$url}}')" > "$META_FILE"
+# ---------- Build JSON to files ----------
+META_FILE="$(mktemp)"
+jq -n --arg url "$PB_PUBLIC_URL" '{meta:{appName:"PocketBase",appUrl:$url}}' > "$META_FILE"
 
 STOR_FILE="$(mktemp)"
 if [ "$PB_S3_STORAGE_ENABLED" = "true" ] \
@@ -198,13 +199,23 @@ else
   echo '{}' > "$BACK_FILE"
 fi
 
-# Merge: meta + optional s3/backups
-SETTINGS_BODY="$(jq -s '
-  .[0] as $meta | .[1] as $s | .[2] as $b |
-  $meta
-  + ( ($s|type=="object" and ($s|keys|length>0)) ? {s3:$s} : {} )
-  + ( ($b|type=="object" and ($b|keys|length>0)) ? {backups:$b} : {} )
-' "$META_FILE" "$STOR_FILE" "$BACK_FILE")"
+# Wrap storage/backups only if they are not empty objects
+WRAP_STOR="$(mktemp)"
+if jq -e 'keys|length>0' "$STOR_FILE" >/dev/null; then
+  jq -n --slurpfile s "$STOR_FILE" '{s3: $s[0]}' > "$WRAP_STOR"
+else
+  echo '{}' > "$WRAP_STOR"
+fi
+
+WRAP_BACK="$(mktemp)"
+if jq -e 'keys|length>0' "$BACK_FILE" >/dev/null; then
+  jq -n --slurpfile b "$BACK_FILE" '{backups: $b[0]}' > "$WRAP_BACK"
+else
+  echo '{}' > "$WRAP_BACK"
+fi
+
+# Merge: meta + wrapped storage + wrapped backups
+SETTINGS_BODY="$(jq -s 'add' "$META_FILE" "$WRAP_STOR" "$WRAP_BACK")"
 
 # PATCH /api/settings
 PATCH_OUT="$(mktemp)"; PATCH_CODE=0
@@ -221,7 +232,7 @@ if [ "$PATCH_CODE" -ne 0 ] || [ "$HTTP_CODE" -ge 400 ]; then
   kill $PB_PID; wait $PB_PID 2>/dev/null || true
   exit 1
 fi
-rm -f "$PATCH_OUT" /tmp/pb_patch_code.txt "$META_FILE" "$STOR_FILE" "$BACK_FILE"
+rm -f "$PATCH_OUT" /tmp/pb_patch_code.txt "$META_FILE" "$STOR_FILE" "$BACK_FILE" "$WRAP_STOR" "$WRAP_BACK"
 
 # Optional connection tests
 if [ "$PB_S3_STORAGE_ENABLED" = "true" ] && [ -n "$PB_S3_STORAGE_BUCKET" ]; then
