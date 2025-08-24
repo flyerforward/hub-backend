@@ -1,1 +1,1 @@
-
+routerAdd("GET", "/healthz", (c) => c.json(200, { ok: true }))
