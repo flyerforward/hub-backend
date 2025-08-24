@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -euo pipefail
 
-echo "[boot] entrypoint v7.4 loaded"
+echo "[boot] entrypoint v7.5 loaded"
 
 ############################################
 # Env
@@ -58,7 +58,7 @@ fi
 ############################################
 # Tools & dirs
 ############################################
-apk add --no-cache aws-cli unzip curl jq rsync >/dev/null 2>&1 || true
+apk add --no-cache aws-cli unzip curl jq rsync sqlite >/dev/null 2>&1 || true
 
 mkdir -p /pb_data /pb_migrations
 [ -d /app/pb_migrations ] && rsync -a --update /app/pb_migrations/ /pb_migrations/
@@ -78,7 +78,6 @@ if [ ! -f /pb_data/data.db ] && [ "$PB_RESTORE_FROM_S3" = "true" ] && [ -n "$PB_
       "${PB_BACKUP_BUCKET_URL%/}/${LATEST_KEY}" /tmp/pb_backup.zip
     unzip -o /tmp/pb_backup.zip -d /tmp/pb_restore
 
-    # Expect DB files at the ZIP root (data.db, logs.db, etc.)
     if [ -f /tmp/pb_restore/data.db ]; then
       echo "[restore] Using 'root files' layout from archive."
       cp -a /tmp/pb_restore/. /pb_data/
@@ -119,17 +118,28 @@ wait $INIT_PID 2>/dev/null || true
 echo "[init] Core/migrations initialized."
 
 ############################################
-# Ensure admin exists + force password
+# Ensure admin (skip create if any admin exists)
 ############################################
-echo "[admin] Creating admin (idempotent) for ${PB_ADMIN_EMAIL}"
-/app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-  admin create "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_create.log 2>&1 || true
-echo "[admin] create output:"; cat /tmp/pb_admin_create.log || true
+ADMINS_TOTAL=$(sqlite3 /pb_data/data.db "SELECT COUNT(*) FROM _admins;" 2>/dev/null || echo 0)
+if [ "${ADMINS_TOTAL:-0}" -gt 0 ]; then
+  echo "[admin] Existing admin(s) detected: $ADMINS_TOTAL — skipping create."
 
-echo "[admin] Forcing password update"
-/app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-  admin update "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_update.log 2>&1 || true
-echo "[admin] update output:"; cat /tmp/pb_admin_update.log || true
+  # If the provided email exists, optionally force-set its password
+  EMAIL_COUNT=$(sqlite3 /pb_data/data.db "SELECT COUNT(*) FROM _admins WHERE email = '$(printf "%s" "$PB_ADMIN_EMAIL" | sed "s/'/''/g")';" 2>/dev/null || echo 0)
+  if [ "${EMAIL_COUNT:-0}" -gt 0 ]; then
+    echo "[admin] Updating password for $PB_ADMIN_EMAIL"
+    /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
+      admin update "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_update.log 2>&1 || true
+    echo "[admin] update output:"; cat /tmp/pb_admin_update.log || true
+  else
+    echo "[admin] Provided PB_ADMIN_EMAIL not found; leaving existing admins unchanged."
+  fi
+else
+  echo "[admin] No admins found; creating $PB_ADMIN_EMAIL"
+  /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
+    admin create "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_create.log 2>&1 || true
+  echo "[admin] create output:"; cat /tmp/pb_admin_create.log || true
+fi
 
 ############################################
 # Bootstrap settings (S3 storage + backups) via API
