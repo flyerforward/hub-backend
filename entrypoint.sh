@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -euo pipefail
 
-echo "[boot] entrypoint v7.3 loaded"
+echo "[boot] entrypoint v7.4 loaded"
 
 ############################################
 # Env
@@ -64,7 +64,7 @@ mkdir -p /pb_data /pb_migrations
 [ -d /app/pb_migrations ] && rsync -a --update /app/pb_migrations/ /pb_migrations/
 
 ############################################
-# First boot: restore from Wasabi (if empty)
+# First boot: restore from Wasabi (root-files layout only)
 ############################################
 if [ ! -f /pb_data/data.db ] && [ "$PB_RESTORE_FROM_S3" = "true" ] && [ -n "$PB_BACKUP_BUCKET_URL" ]; then
   echo "[restore] No data.db; attempting restore from $PB_BACKUP_BUCKET_URL"
@@ -77,12 +77,16 @@ if [ ! -f /pb_data/data.db ] && [ "$PB_RESTORE_FROM_S3" = "true" ] && [ -n "$PB_
     aws --endpoint-url "$AWS_S3_ENDPOINT" s3 cp \
       "${PB_BACKUP_BUCKET_URL%/}/${LATEST_KEY}" /tmp/pb_backup.zip
     unzip -o /tmp/pb_backup.zip -d /tmp/pb_restore
-    if [ -d /tmp/pb_restore/pb_data ]; then
-      cp -a /tmp/pb_restore/pb_data/. /pb_data/
-      echo "[restore] Restore completed."
+
+    # Expect DB files at the ZIP root (data.db, logs.db, etc.)
+    if [ -f /tmp/pb_restore/data.db ]; then
+      echo "[restore] Using 'root files' layout from archive."
+      cp -a /tmp/pb_restore/. /pb_data/
+      echo "[restore] Restore completed from root layout."
     else
-      echo "[restore] Unexpected archive layout; skipping restore."
+      echo "[restore] Required files not found at archive root; skipping restore."
     fi
+
     rm -rf /tmp/pb_backup.zip /tmp/pb_restore
   else
     echo "[restore] No backups found at $PB_BACKUP_BUCKET_URL; starting fresh."
@@ -175,7 +179,7 @@ if [ "$PB_S3_STORAGE_ENABLED" = "true" ] \
     --arg ak "$PB_S3_STORAGE_ACCESS_KEY" \
     --arg sk "$PB_S3_STORAGE_SECRET" \
     --argjson fps "$PB_S3_STORAGE_FORCE_PATH_STYLE" \
-    '{enabled:true,bucket:$b,region:$r,endpoint:$e,accessKey:$ak,secret:$sk,forcePathStyle:$fps}' > "$STOR_FILE"
+    '{s3:{enabled:true,bucket:$b,region:$r,endpoint:$e,accessKey:$ak,secret:$sk,forcePathStyle:$fps}}' > "$STOR_FILE"
 else
   echo '{}' > "$STOR_FILE"
 fi
@@ -194,28 +198,13 @@ if [ "$PB_S3_BACKUPS_ENABLED" = "true" ] \
     --arg ak "$PB_S3_BACKUPS_ACCESS_KEY" \
     --arg sk "$PB_S3_BACKUPS_SECRET" \
     --argjson fps "$PB_S3_BACKUPS_FORCE_PATH_STYLE" \
-    '{cron:$cron,cronMaxKeep:($keep|tonumber),s3:{enabled:true,bucket:$b,region:$r,endpoint:$e,accessKey:$ak,secret:$sk,forcePathStyle:$fps}}' > "$BACK_FILE"
+    '{backups:{cron:$cron,cronMaxKeep:($keep|tonumber),s3:{enabled:true,bucket:$b,region:$r,endpoint:$e,accessKey:$ak,secret:$sk,forcePathStyle:$fps}}}' > "$BACK_FILE"
 else
   echo '{}' > "$BACK_FILE"
 fi
 
-# Wrap storage/backups only if they are not empty objects
-WRAP_STOR="$(mktemp)"
-if jq -e 'keys|length>0' "$STOR_FILE" >/dev/null; then
-  jq -n --slurpfile s "$STOR_FILE" '{s3: $s[0]}' > "$WRAP_STOR"
-else
-  echo '{}' > "$WRAP_STOR"
-fi
-
-WRAP_BACK="$(mktemp)"
-if jq -e 'keys|length>0' "$BACK_FILE" >/dev/null; then
-  jq -n --slurpfile b "$BACK_FILE" '{backups: $b[0]}' > "$WRAP_BACK"
-else
-  echo '{}' > "$WRAP_BACK"
-fi
-
-# Merge: meta + wrapped storage + wrapped backups
-SETTINGS_BODY="$(jq -s 'add' "$META_FILE" "$WRAP_STOR" "$WRAP_BACK")"
+# Merge: meta + storage + backups
+SETTINGS_BODY="$(jq -s 'add' "$META_FILE" "$STOR_FILE" "$BACK_FILE")"
 
 # PATCH /api/settings
 PATCH_OUT="$(mktemp)"; PATCH_CODE=0
@@ -232,7 +221,7 @@ if [ "$PATCH_CODE" -ne 0 ] || [ "$HTTP_CODE" -ge 400 ]; then
   kill $PB_PID; wait $PB_PID 2>/dev/null || true
   exit 1
 fi
-rm -f "$PATCH_OUT" /tmp/pb_patch_code.txt "$META_FILE" "$STOR_FILE" "$BACK_FILE" "$WRAP_STOR" "$WRAP_BACK"
+rm -f "$PATCH_OUT" /tmp/pb_patch_code.txt "$META_FILE" "$STOR_FILE" "$BACK_FILE"
 
 # Optional connection tests
 if [ "$PB_S3_STORAGE_ENABLED" = "true" ] && [ -n "$PB_S3_STORAGE_BUCKET" ]; then
