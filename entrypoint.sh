@@ -1,12 +1,12 @@
 #!/usr/bin/env sh
 set -e
 
-# Create writable runtime dirs (these are volumes in Dokploy) 
+# Create writable runtime dirs (these are volumes in Dokploy)
 mkdir -p /work/pb_migrations /pb_data
 
 # Seed runtime migrations once from the image
 if [ -z "$(ls -A /work/pb_migrations 2>/dev/null)" ] && [ -d /app/pb_migrations_seed ]; then
-  cp -a /app/pb_migrations/. /work/pb_migrations/
+  cp -a /app/pb_migrations_seed/. /work/pb_migrations/
 fi
 
 # Start PocketBase:
