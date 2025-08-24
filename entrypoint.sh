@@ -1,4 +1,5 @@
 #!/usr/bin/env sh
+echo "[boot] entrypoint v3 loaded"
 set -euo pipefail
 
 # --------------------------
