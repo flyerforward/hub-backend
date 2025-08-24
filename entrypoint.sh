@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -euo pipefail
 
-echo "[boot] entrypoint v7.1 loaded"
+echo "[boot] entrypoint v7.1 loaded" 
 
 ############################################
 # Env (same as before)
