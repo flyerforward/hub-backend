@@ -1,7 +1,9 @@
 #!/usr/bin/env sh
 set -euo pipefail
 
-echo "[boot] entrypoint v7.19 (stateless + always-restore-when-specified) loaded"
+[ "${PB_DEBUG:-false}" = "true" ] && set -x
+
+echo "[boot] entrypoint v7.22 (stateless, hard-restore + WAL checkpoint) loaded"
 
 ############################################
 # Env
@@ -39,9 +41,9 @@ PB_S3_BACKUPS_FORCE_PATH_STYLE="${PB_S3_BACKUPS_FORCE_PATH_STYLE:-false}"
 PB_BACKUPS_CRON="${PB_BACKUPS_CRON:-0 3 * * *}"
 PB_BACKUPS_MAX_KEEP="${PB_BACKUPS_MAX_KEEP:-7}"
 
-# Explicit restore only (no auto-latest fallback)
+# Explicit restore only
 PB_BACKUP_BUCKET_URL="${PB_BACKUP_BUCKET_URL:-}"
-PB_RESTORE_OBJECT="${PB_RESTORE_OBJECT:-}"   # Filename under PB_BACKUP_BUCKET_URL or full s3:// URL
+PB_RESTORE_OBJECT="${PB_RESTORE_OBJECT:-}"   # filename under PB_BACKUP_BUCKET_URL or full s3:// URL
 
 # AWS (Wasabi)
 AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -64,22 +66,37 @@ mkdir -p /pb_data /pb_migrations
 
 sql() { sqlite3 /pb_data/data.db "$1"; }
 wal_ckpt() { sqlite3 /pb_data/data.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true; }
+vacuum_db() { sqlite3 /pb_data/data.db "VACUUM;" >/dev/null 2>&1 || true; }
 
 ############################################
 # Restore helpers
 ############################################
-_restore_from_zip() {
+_restore_from_zip_any_layout() {
+  # Extracts ZIP, finds the folder that contains data.db, rsyncs its contents into /pb_data
   local zip_path="$1"
-  unzip -o "$zip_path" -d /tmp/pb_restore
-  if [ -f /tmp/pb_restore/data.db ]; then
-    echo "[restore] Using 'root files' layout from archive."
-    cp -a /tmp/pb_restore/. /pb_data/
-    echo "[restore] Restore completed."
-  else
-    echo "[restore] Required files not found at archive root; restore aborted."
+  local tmpdir="/tmp/pb_restore"
+  rm -rf "$tmpdir"
+  mkdir -p "$tmpdir"
+
+  unzip -o "$zip_path" -d "$tmpdir" >/dev/null
+
+  local data_path
+  data_path="$(find "$tmpdir" -maxdepth 4 -type f -name 'data.db' | head -n1 || true)"
+  if [ -z "$data_path" ]; then
+    echo "[restore] ERROR: data.db not found in archive."
+    rm -rf "$zip_path" "$tmpdir"
     return 1
   fi
-  rm -rf "$zip_path" /tmp/pb_restore
+
+  local src_dir
+  src_dir="$(dirname "$data_path")"
+  echo "[restore] Found data root: $src_dir"
+
+  # Copy the entire DB dir (data.db, wal/shm if present, logs.db, etc.) and delete anything extra on target
+  rsync -a --delete "$src_dir"/ /pb_data/
+
+  rm -rf "$zip_path" "$tmpdir"
+  return 0
 }
 
 _s3_object_exists() {
@@ -88,60 +105,57 @@ _s3_object_exists() {
 }
 
 ############################################
-# Restore (ALWAYS when PB_RESTORE_OBJECT is set & exists)
+# Always restore when PB_RESTORE_OBJECT is set
 ############################################
+echo "[env] PB_RESTORE_OBJECT=${PB_RESTORE_OBJECT:-<unset>}"
 if [ -n "$PB_RESTORE_OBJECT" ]; then
-  # Resolve RESTORE_URL from env
+  # Resolve full URL
   if printf "%s" "$PB_RESTORE_OBJECT" | grep -q '^s3://'; then
     RESTORE_URL="$PB_RESTORE_OBJECT"
   else
-    if [ -z "$PB_BACKUP_BUCKET_URL" ]; then
-      echo "[restore] PB_RESTORE_OBJECT provided but PB_BACKUP_BUCKET_URL is empty; cannot resolve key."
-      RESTORE_URL=""
-    else
-      RESTORE_URL="${PB_BACKUP_BUCKET_URL%/}/$PB_RESTORE_OBJECT"
-    fi
+    [ -z "$PB_BACKUP_BUCKET_URL" ] && { echo "[restore] ERROR: PB_BACKUP_BUCKET_URL empty"; exit 1; }
+    RESTORE_URL="${PB_BACKUP_BUCKET_URL%/}/$PB_RESTORE_OBJECT"
+  fi
+  echo "[restore] Resolved: $RESTORE_URL"
+
+  # Verify object exists
+  if ! _s3_object_exists "$RESTORE_URL"; then
+    echo "[restore] ERROR: Object not found: $RESTORE_URL"
+    exit 1
   fi
 
-  if [ -n "${RESTORE_URL:-}" ] && _s3_object_exists "$RESTORE_URL"; then
-    # Backup existing data (if any), then restore
-    if [ -d /pb_data ] && [ "$(ls -A /pb_data 2>/dev/null | wc -l)" -gt 0 ]; then
-      TS="$(date +%Y%m%d-%H%M%S)"
-      BACKUP_DIR="/pb_data._pre_restore_$TS"
-      echo "[restore] Backing up existing /pb_data to $BACKUP_DIR"
-      mkdir -p "$BACKUP_DIR"
-      find /pb_data -mindepth 1 -maxdepth 1 -exec mv {} "$BACKUP_DIR"/ \;
-    fi
-
-    echo "[restore] Restoring explicit object: $RESTORE_URL"
-    if aws --endpoint-url "$AWS_S3_ENDPOINT" s3 cp "$RESTORE_URL" /tmp/pb_backup.zip; then
-      mkdir -p /pb_data
-      if ! _restore_from_zip /tmp/pb_backup.zip; then
-        echo "[restore] Restore failed; attempting to revert previous data if backup exists."
-        if [ -d "${BACKUP_DIR:-}" ]; then
-          find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -exec mv {} /pb_data/ \;
-          rmdir "$BACKUP_DIR" 2>/dev/null || true
-          echo "[restore] Reverted to previous data."
-        fi
-      else
-        # restore succeeded; clean up backup dir (optional, keep if you want)
-        :
-      fi
-    else
-      echo "[restore] Failed to download $RESTORE_URL"
-      # try to revert if we moved data out
-      if [ -d "${BACKUP_DIR:-}" ]; then
-        find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -exec mv {} /pb_data/ \;
-        rmdir "$BACKUP_DIR" 2>/dev/null || true
-        echo "[restore] Reverted to previous data."
-      fi
-    fi
-  else
-    echo "[restore] Specified PB_RESTORE_OBJECT not found: ${RESTORE_URL:-<unset>}"
-    echo "[restore] Continuing with existing data."
+  # Snapshot current data, then *empty* /pb_data
+  if [ -d /pb_data ] && [ "$(ls -A /pb_data 2>/dev/null | wc -l)" -gt 0 ]; then
+    TS="$(date +%Y%m%d-%H%M%S)"
+    BACKUP_DIR="/pb_data._pre_restore_$TS"
+    echo "[restore] Backing up current /pb_data to $BACKUP_DIR"
+    mkdir -p "$BACKUP_DIR"
+    find /pb_data -mindepth 1 -maxdepth 1 -exec mv {} "$BACKUP_DIR"/ \;
   fi
+  mkdir -p /pb_data
+
+  # Download and apply
+  echo "[restore] Downloading archive…"
+  aws --endpoint-url "$AWS_S3_ENDPOINT" s3 cp "$RESTORE_URL" /tmp/pb_backup.zip
+
+  echo "[restore] Applying archive (rsync --delete)…"
+  if ! _restore_from_zip_any_layout /tmp/pb_backup.zip; then
+    echo "[restore] ERROR: Restore failed; attempting to revert previous data."
+    if [ -d "${BACKUP_DIR:-}" ]; then
+      find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -exec mv {} /pb_data/ \;
+      rmdir "$BACKUP_DIR" 2>/dev/null || true
+      echo "[restore] Reverted to previous data."
+    fi
+    exit 1
+  fi
+
+  # Normalize SQLite state to avoid WAL surprises
+  echo "[restore] Forcing WAL checkpoint + VACUUM…"
+  wal_ckpt
+  vacuum_db
+
+  echo "[restore] Done. Pre-restore snapshot (kept): ${BACKUP_DIR:-<none>}"
 else
-  # No restore requested; do nothing (start fresh if empty, keep existing otherwise)
   if [ ! -f /pb_data/data.db ]; then
     echo "[restore] No PB_RESTORE_OBJECT and no data.db → starting fresh."
   fi
@@ -269,8 +283,7 @@ if [ "$PB_ADMIN_ENFORCE_SINGLE" = "true" ]; then
 fi
 
 ############################################
-# Settings (STATELESS):
-#   Build desired JSON → GET live → trim both → compare → PATCH if different
+# Settings (STATELESS): compare & patch
 ############################################
 META_FILE="$(mktemp)"; STOR_FILE="$(mktemp)"; BACK_FILE="$(mktemp)"
 DESIRED_FILE="$(mktemp)"; DESIRED_TRIM_FILE="$(mktemp)"
