@@ -1,6 +1,6 @@
 FROM alpine:3.20
 
-ARG PB_VERSION=0.29.3
+ARG PB_VERSION=0.22.9
 WORKDIR /app
 
 # Tools needed by entrypoint/bootstrap
