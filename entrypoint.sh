@@ -3,7 +3,7 @@ set -euo pipefail
 
 [ "${PB_DEBUG:-false}" = "true" ] && set -x
 
-echo "[boot] entrypoint v8.1 (temp-admin settings, no-restore) loaded"
+echo "[boot] entrypoint v8.2 (temp-admin settings, no-restore, init-wait) loaded"
 
 ############################################
 # Optional encryption + public URL
@@ -59,13 +59,18 @@ health_wait() {
 }
 
 gen_strong_pass() {
-  # Generate >=16 alnum chars; loop until we get enough (busybox/filters can shrink it)
   local p=""
   for _ in 1 2 3 4 5; do
     p="$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr -dc 'A-Za-z0-9' | cut -c1-24)"
     [ "${#p}" -ge 16 ] && { echo "$p"; return 0; }
   done
   return 1
+}
+
+table_exists() {
+  local tbl="$1"
+  [ -f /pb_data/data.db ] || return 1
+  sqlite3 /pb_data/data.db "SELECT name FROM sqlite_master WHERE type='table' AND name='$tbl';" | grep -q "$tbl"
 }
 
 ############################################
@@ -80,9 +85,25 @@ INIT_PID=$!
 if ! health_wait "http://127.0.0.1:${INIT_PORT}/api/health"; then
   echo "[init] PB failed to start"; cat /tmp/pb_init.log || true; exit 1
 fi
+
+# Wait until base tables are actually created (health alone isn't enough)
+echo "[init] Waiting for base tables (_admins, _params)…"
+for i in $(seq 1 80); do  # ~20s max (80*0.25s)
+  if table_exists "_admins" && table_exists "_params"; then
+    break
+  fi
+  sleep 0.25
+  if [ "$i" -eq 80 ]; then
+    echo "[init] Timed out waiting for tables; init log:"
+    tail -n 200 /tmp/pb_init.log || true
+    exit 1
+  fi
+done
+
+# Small grace, then stop init server
 sleep 0.5
 kill $INIT_PID; wait $INIT_PID 2>/dev/null || true
-echo "[init] Core/migrations initialized."
+echo "[init] Core/migrations initialized and tables present."
 
 ############################################
 # 2) Build desired settings payload
@@ -138,12 +159,11 @@ fi
 echo "[admin] Creating temporary admin: $TMP_EMAIL"
 /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
   admin create "$TMP_EMAIL" "$TMP_PASS" >/tmp/pb_admin_create.log 2>&1 || true
-# Show CLI output
 tail -n +1 /tmp/pb_admin_create.log || true
 
-# Validate creation actually happened (avoid silent failure)
+# Double-check creation
 if ! sqlite3 /pb_data/data.db "SELECT email FROM _admins WHERE email='$TMP_EMAIL';" | grep -q "$TMP_EMAIL"; then
-  echo "[admin] ERROR: temp admin was not created (password policy? db locked?)."
+  echo "[admin] ERROR: temp admin was not created."
   cat /tmp/pb_admin_create.log || true
   exit 1
 fi
@@ -208,4 +228,3 @@ echo "[bootstrap] Done. Launching PocketBase."
 exec /app/pocketbase $ENCRYPTION_ARG \
   --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
   serve --http 0.0.0.0:8090
- 
