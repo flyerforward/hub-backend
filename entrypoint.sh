@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -euo pipefail
 
-echo "[boot] entrypoint v7.10 loaded"
+echo "[boot] entrypoint v7.11 loaded"
 
 ############################################
 # Env
@@ -61,7 +61,8 @@ fi
 ############################################
 # Tools & dirs
 ############################################
-apk add --no-cache aws-cli unzip curl jq rsync sqlite >/dev/null 2>&1 || true
+apk add --no-cache aws-cli unzip curl jq rsync sqlite coreutils >/dev/null 2>&1 || true
+
 mkdir -p /pb_data /pb_migrations
 [ -d /app/pb_migrations ] && rsync -a --update /app/pb_migrations/ /pb_migrations/
 
@@ -146,7 +147,7 @@ else
 fi
 
 ############################################
-# Build "desired" settings as files (no inline jq)
+# Build "desired" settings JSON and hash it
 ############################################
 META_FILE="$(mktemp)"; STOR_FILE="$(mktemp)"; BACK_FILE="$(mktemp)"
 jq -n --arg url "$PB_PUBLIC_URL" '{meta:{appName:"PocketBase",appUrl:$url}}' > "$META_FILE"
@@ -171,7 +172,6 @@ if [ "$PB_S3_BACKUPS_ENABLED" = "true" ] \
    && [ -n "$PB_S3_BACKUPS_BUCKET" ] && [ -n "$PB_S3_BACKUPS_REGION" ] \
    && [ -n "$PB_S3_BACKUPS_ENDPOINT" ] && [ -n "$PB_S3_BACKUPS_ACCESS_KEY" ] \
    && [ -n "$PB_S3_BACKUPS_SECRET" ] && [ -n "$PB_BACKUPS_CRON" ] && [ -n "$PB_BACKUPS_MAX_KEEP" ]; then
-  # ensure keep is numeric to jq
   jq -n \
     --arg cron "$PB_BACKUPS_CRON" \
     --argjson keep "$(printf '%s' "$PB_BACKUPS_MAX_KEEP")" \
@@ -189,31 +189,33 @@ fi
 DESIRED_FILE="$(mktemp)"
 jq -s 'add' "$META_FILE" "$STOR_FILE" "$BACK_FILE" > "$DESIRED_FILE"
 
-############################################
-# Compare desired vs current (avoid login if no change)
-############################################
-CURRENT_RAW="$(sqlite3 /pb_data/data.db "SELECT value FROM _params WHERE key='settings' LIMIT 1;" 2>/dev/null || echo '')"
-if [ -z "$CURRENT_RAW" ]; then
-  echo "[settings] No existing settings row; will apply desired settings."
-  NEEDS_PATCH="yes"
+# Trim to only the fields we manage, then hash
+DESIRED_TRIM_FILE="$(mktemp)"
+jq '{meta:{appUrl:.meta.appUrl}, s3, backups}' "$DESIRED_FILE" | jq -S . > "$DESIRED_TRIM_FILE"
+DESIRED_SHA="$(sha256sum "$DESIRED_TRIM_FILE" | awk '{print $1}')"
+
+APPLIED_SHA_FILE="/pb_data/.settings_sha256"
+if [ -f "$APPLIED_SHA_FILE" ]; then
+  PREV_SHA="$(cat "$APPLIED_SHA_FILE" 2>/dev/null || true)"
 else
-  CURRENT_TRIM="$(printf '%s' "$CURRENT_RAW" | jq '{meta:{appUrl:.meta.appUrl}, s3, backups}')"
-  DESIRED_TRIM="$(jq '{meta:{appUrl:.meta.appUrl}, s3, backups}' "$DESIRED_FILE")"
-  if diff -u <(printf '%s' "$CURRENT_TRIM" | jq -S .) <(printf '%s' "$DESIRED_TRIM" | jq -S .) >/dev/null 2>&1; then
-    echo "[settings] Current settings already match desired. Skipping admin login & PATCH."
-    exec /app/pocketbase $ENCRYPTION_ARG \
-      --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
-      serve --http 0.0.0.0:8090
-  else
-    echo "[settings] Settings differ; will login and PATCH."
-  fi
+  PREV_SHA=""
 fi
+
+if [ "$DESIRED_SHA" = "$PREV_SHA" ]; then
+  echo "[settings] Desired settings unchanged (hash match). Skipping login & PATCH."
+  rm -f "$META_FILE" "$STOR_FILE" "$BACK_FILE" "$DESIRED_FILE" "$DESIRED_TRIM_FILE" 2>/dev/null || true
+  exec /app/pocketbase $ENCRYPTION_ARG \
+    --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
+    serve --http 0.0.0.0:8090
+fi
+
+echo "[settings] Desired settings differ (or first run). Proceeding to login & PATCH."
 
 ############################################
 # Temp server for settings & conditional password update
 ############################################
 BOOT_PORT=8099
-echo "[bootstrap] Starting temporary PB on :${BOOT_PORT} for settings (changes pending)…"
+echo "[bootstrap] Starting temporary PB on :${BOOT_PORT} for settings…"
 /app/pocketbase $ENCRYPTION_ARG \
   --dev --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
   serve --http 127.0.0.1:${BOOT_PORT} >/tmp/pb_bootstrap.log 2>&1 &
@@ -266,8 +268,11 @@ if [ "$PATCH_CODE" -ne 0 ] || [ "$HTTP_CODE" -ge 400 ]; then
   exit 1
 fi
 
-# Cleanup temp files & start real server
-rm -f "$META_FILE" "$STOR_FILE" "$BACK_FILE" "$DESIRED_FILE" "$PATCH_OUT" /tmp/pb_patch_code.txt 2>/dev/null || true
+# Write the new applied-hash so future deploys skip login
+echo "$DESIRED_SHA" > "$APPLIED_SHA_FILE"
+
+# Cleanup & start real server
+rm -f "$META_FILE" "$STOR_FILE" "$BACK_FILE" "$DESIRED_FILE" "$DESIRED_TRIM_FILE" "$PATCH_OUT" /tmp/pb_patch_code.txt 2>/dev/null || true
 kill $PB_PID; wait $PB_PID 2>/dev/null || true
 echo "[bootstrap] Settings configured."
 
