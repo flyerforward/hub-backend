@@ -3,7 +3,7 @@ set -euo pipefail
 
 [ "${PB_DEBUG:-false}" = "true" ] && set -x
 
-echo "[boot] entrypoint v8.0 (temp-admin settings, no-restore) loaded"
+echo "[boot] entrypoint v8.1 (temp-admin settings, no-restore) loaded"
 
 ############################################
 # Optional encryption + public URL
@@ -58,6 +58,16 @@ health_wait() {
   return 1
 }
 
+gen_strong_pass() {
+  # Generate >=16 alnum chars; loop until we get enough (busybox/filters can shrink it)
+  local p=""
+  for _ in 1 2 3 4 5; do
+    p="$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr -dc 'A-Za-z0-9' | cut -c1-24)"
+    [ "${#p}" -ge 16 ] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
 ############################################
 # 1) One-time core init to create DB + apply migrations
 ############################################
@@ -70,7 +80,6 @@ INIT_PID=$!
 if ! health_wait "http://127.0.0.1:${INIT_PORT}/api/health"; then
   echo "[init] PB failed to start"; cat /tmp/pb_init.log || true; exit 1
 fi
-# Give PB a moment to finish first-run tasks
 sleep 0.5
 kill $INIT_PID; wait $INIT_PID 2>/dev/null || true
 echo "[init] Core/migrations initialized."
@@ -82,10 +91,8 @@ META_FILE="$(mktemp)"; STOR_FILE="$(mktemp)"; BACK_FILE="$(mktemp)"
 DESIRED_FILE="$(mktemp)"; DESIRED_TRIM_FILE="$(mktemp)"
 LIVE_FILE="$(mktemp)"; LIVE_TRIM_FILE="$(mktemp)"
 
-# meta
 jq -n --arg url "$PB_PUBLIC_URL" '{meta:{appName:"PocketBase",appUrl:$url}}' > "$META_FILE"
 
-# s3 storage
 if [ "$PB_S3_STORAGE_ENABLED" = "true" ] \
    && [ -n "$PB_S3_STORAGE_BUCKET" ] && [ -n "$PB_S3_STORAGE_REGION" ] \
    && [ -n "$PB_S3_STORAGE_ENDPOINT" ] && [ -n "$PB_S3_STORAGE_ACCESS_KEY" ] \
@@ -99,7 +106,6 @@ else
   echo '{}' > "$STOR_FILE"
 fi
 
-# backups
 if [ "$PB_S3_BACKUPS_ENABLED" = "true" ] \
    && [ -n "$PB_S3_BACKUPS_BUCKET" ] && [ -n "$PB_S3_BACKUPS_REGION" ] \
    && [ -n "$PB_S3_BACKUPS_ENDPOINT" ] && [ -n "$PB_S3_BACKUPS_ACCESS_KEY" ] \
@@ -119,16 +125,28 @@ jq -s 'add' "$META_FILE" "$STOR_FILE" "$BACK_FILE" > "$DESIRED_FILE"
 jq '{meta:{appUrl:.meta.appUrl}, s3, backups}' "$DESIRED_FILE" | jq -S . > "$DESIRED_TRIM_FILE"
 
 ############################################
-# 3) Create TEMP admin offline (CLI), start temp PB, GET+PATCH settings, delete admin
+# 3) Create TEMP admin, start temp PB, GET+PATCH settings, delete admin
 ############################################
 TMP_EMAIL="svc-setup-$(date +%s)-$RANDOM@local.invalid"
-TMP_PASS="$(head -c 24 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 20)"
+TMP_PASS="$(gen_strong_pass || true)"
+
+if [ -z "${TMP_PASS:-}" ] || [ "${#TMP_PASS}" -lt 16 ]; then
+  echo "[admin] FATAL: failed to generate a valid temporary password"
+  exit 1
+fi
 
 echo "[admin] Creating temporary admin: $TMP_EMAIL"
 /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
   admin create "$TMP_EMAIL" "$TMP_PASS" >/tmp/pb_admin_create.log 2>&1 || true
-# show output for debugging
+# Show CLI output
 tail -n +1 /tmp/pb_admin_create.log || true
+
+# Validate creation actually happened (avoid silent failure)
+if ! sqlite3 /pb_data/data.db "SELECT email FROM _admins WHERE email='$TMP_EMAIL';" | grep -q "$TMP_EMAIL"; then
+  echo "[admin] ERROR: temp admin was not created (password policy? db locked?)."
+  cat /tmp/pb_admin_create.log || true
+  exit 1
+fi
 
 BOOT_PORT=8099
 echo "[auth] Starting temp PB on :${BOOT_PORT} for settings API…"
@@ -140,7 +158,6 @@ if ! health_wait "http://127.0.0.1:${BOOT_PORT}/api/health"; then
   echo "[auth] Temp PB failed to start"; tail -n 200 /tmp/pb_bootstrap.log || true; kill $PB_PID 2>/dev/null || true; exit 1
 fi
 
-# Auth with temp admin
 AUTH_BODY="$(jq -n --arg id "$TMP_EMAIL" --arg pw "$TMP_PASS" '{identity:$id, password:$pw}')"
 AUTH_JSON="$(curl -sS -X POST "http://127.0.0.1:${BOOT_PORT}/api/admins/auth-with-password" \
   -H "Content-Type: application/json" --data-binary "$AUTH_BODY" || true)"
@@ -153,7 +170,6 @@ if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
 fi
 echo "[auth] Temp admin authenticated."
 
-# GET current settings (trim & compare)
 curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
   "http://127.0.0.1:${BOOT_PORT}/api/settings" > "$LIVE_FILE"
 jq '{meta:{appUrl:.meta.appUrl}, s3, backups}' "$LIVE_FILE" | jq -S . > "$LIVE_TRIM_FILE"
@@ -192,3 +208,4 @@ echo "[bootstrap] Done. Launching PocketBase."
 exec /app/pocketbase $ENCRYPTION_ARG \
   --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
   serve --http 0.0.0.0:8090
+ 
