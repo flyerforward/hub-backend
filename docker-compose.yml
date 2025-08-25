@@ -3,18 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      cache_from: []                     # <-- disables build cache
-      args:
-        BUILD_TIMESTAMP: ${BUILD_TIMESTAMP:-}   # changes every deploy automatically
     container_name: pocketbase
     command: ["/app/entrypoint.sh"]
-    restart: always
-    deploy:
-      update_config:
-        order: start-first
-        failure_action: rollback
-      restart_policy:
-        condition: any
     environment:
       # Dokploy will inject your .env automatically if configured
       PB_ADMIN_EMAIL: ${PB_ADMIN_EMAIL}
