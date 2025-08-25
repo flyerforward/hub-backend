@@ -3,7 +3,7 @@ set -euo pipefail
 
 [ "${PB_DEBUG:-false}" = "true" ] && set -x
 
-echo "[boot] entrypoint v8.2 (temp-admin settings, no-restore, init-wait) loaded"
+echo "[boot] entrypoint v8.3 (migrate-up, temp-admin settings, no-restore) loaded"
 
 ############################################
 # Optional encryption + public URL
@@ -74,36 +74,23 @@ table_exists() {
 }
 
 ############################################
-# 1) One-time core init to create DB + apply migrations
+# 1) Ensure core schema is created: run migrations OFFLINE
 ############################################
-INIT_PORT=8097
-echo "[init] Starting PocketBase once on :${INIT_PORT} to init DB/migrations…"
-/app/pocketbase $ENCRYPTION_ARG --dev --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
-  serve --http 127.0.0.1:${INIT_PORT} >/tmp/pb_init.log 2>&1 &
-INIT_PID=$!
+echo "[migrate] Running 'pocketbase migrate up' (offline)…"
+/app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations migrate up >/tmp/pb_migrate.log 2>&1 || true
+# Show migrate output for visibility
+tail -n +1 /tmp/pb_migrate.log || true
 
-if ! health_wait "http://127.0.0.1:${INIT_PORT}/api/health"; then
-  echo "[init] PB failed to start"; cat /tmp/pb_init.log || true; exit 1
-fi
-
-# Wait until base tables are actually created (health alone isn't enough)
-echo "[init] Waiting for base tables (_admins, _params)…"
-for i in $(seq 1 80); do  # ~20s max (80*0.25s)
+# Sanity-check the core tables exist now (avoid races)
+/bin/true
+for i in $(seq 1 40); do  # ~10s max
   if table_exists "_admins" && table_exists "_params"; then
     break
   fi
   sleep 0.25
-  if [ "$i" -eq 80 ]; then
-    echo "[init] Timed out waiting for tables; init log:"
-    tail -n 200 /tmp/pb_init.log || true
-    exit 1
-  fi
+  [ "$i" -eq 40 ] && { echo "[migrate] ERROR: core tables missing after migrate."; exit 1; }
 done
-
-# Small grace, then stop init server
-sleep 0.5
-kill $INIT_PID; wait $INIT_PID 2>/dev/null || true
-echo "[init] Core/migrations initialized and tables present."
+echo "[migrate] Core tables present."
 
 ############################################
 # 2) Build desired settings payload
@@ -156,7 +143,7 @@ if [ -z "${TMP_PASS:-}" ] || [ "${#TMP_PASS}" -lt 16 ]; then
   exit 1
 fi
 
-echo "[admin] Creating temporary admin: $TMP_EMAIL"
+echo "[admin] Creating temporary admin (CLI): $TMP_EMAIL"
 /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
   admin create "$TMP_EMAIL" "$TMP_PASS" >/tmp/pb_admin_create.log 2>&1 || true
 tail -n +1 /tmp/pb_admin_create.log || true
@@ -213,7 +200,7 @@ fi
 
 # Stop temp PB and remove the temp admin offline
 kill $PB_PID 2>/dev/null || true; wait $PB_PID 2>/dev/null || true
-echo "[admin] Deleting temporary admin: $TMP_EMAIL"
+echo "[admin] Deleting temporary admin (CLI): $TMP_EMAIL"
 /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
   admin delete "$TMP_EMAIL" >/tmp/pb_admin_delete.log 2>&1 || true
 tail -n +1 /tmp/pb_admin_delete.log || true
@@ -221,7 +208,7 @@ tail -n +1 /tmp/pb_admin_delete.log || true
 # Cleanup temp files
 rm -f "$META_FILE" "$STOR_FILE" "$BACK_FILE" "$DESIRED_FILE" "$DESIRED_TRIM_FILE" \
       "$LIVE_FILE" "$LIVE_TRIM_FILE" /tmp/pb_patch_code.txt \
-      /tmp/pb_admin_create.log /tmp/pb_admin_delete.log 2>/dev/null || true
+      /tmp/pb_admin_create.log /tmp/pb_admin_delete.log /tmp/pb_migrate.log 2>/dev/null || true
 
 echo "[bootstrap] Done. Launching PocketBase."
 
