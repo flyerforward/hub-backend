@@ -1,13 +1,19 @@
 #!/usr/bin/env sh
 set -euo pipefail
 
-echo "[boot] entrypoint v7.5 loaded"
+echo "[boot] entrypoint v7.7 loaded"
 
 ############################################
 # Env
 ############################################
 : "${PB_ADMIN_EMAIL:?Set PB_ADMIN_EMAIL}"
 : "${PB_ADMIN_PASSWORD:?Set PB_ADMIN_PASSWORD}"
+
+# Delete any non-matching admins and replace with env admin (dangerous, but requested)
+PB_ADMIN_ENFORCE_SINGLE="${PB_ADMIN_ENFORCE_SINGLE:-true}"
+
+# Avoid logging out: don't rotate password unless explicitly requested
+PB_ADMIN_FORCE_UPDATE_PASSWORD="${PB_ADMIN_FORCE_UPDATE_PASSWORD:-false}"
 
 PB_ENCRYPTION="${PB_ENCRYPTION:-}"
 ENCRYPTION_ARG=""
@@ -77,7 +83,6 @@ if [ ! -f /pb_data/data.db ] && [ "$PB_RESTORE_FROM_S3" = "true" ] && [ -n "$PB_
     aws --endpoint-url "$AWS_S3_ENDPOINT" s3 cp \
       "${PB_BACKUP_BUCKET_URL%/}/${LATEST_KEY}" /tmp/pb_backup.zip
     unzip -o /tmp/pb_backup.zip -d /tmp/pb_restore
-
     if [ -f /tmp/pb_restore/data.db ]; then
       echo "[restore] Using 'root files' layout from archive."
       cp -a /tmp/pb_restore/. /pb_data/
@@ -85,7 +90,6 @@ if [ ! -f /pb_data/data.db ] && [ "$PB_RESTORE_FROM_S3" = "true" ] && [ -n "$PB_
     else
       echo "[restore] Required files not found at archive root; skipping restore."
     fi
-
     rm -rf /tmp/pb_backup.zip /tmp/pb_restore
   else
     echo "[restore] No backups found at $PB_BACKUP_BUCKET_URL; starting fresh."
@@ -118,27 +122,49 @@ wait $INIT_PID 2>/dev/null || true
 echo "[init] Core/migrations initialized."
 
 ############################################
-# Ensure admin (skip create if any admin exists)
+# Admin enforcement
 ############################################
 ADMINS_TOTAL=$(sqlite3 /pb_data/data.db "SELECT COUNT(*) FROM _admins;" 2>/dev/null || echo 0)
-if [ "${ADMINS_TOTAL:-0}" -gt 0 ]; then
-  echo "[admin] Existing admin(s) detected: $ADMINS_TOTAL — skipping create."
+ESC_EMAIL="$(printf "%s" "$PB_ADMIN_EMAIL" | sed "s/'/''/g")"
+EMAIL_COUNT=$(sqlite3 /pb_data/data.db "SELECT COUNT(*) FROM _admins WHERE email = '$ESC_EMAIL';" 2>/dev/null || echo 0)
 
-  # If the provided email exists, optionally force-set its password
-  EMAIL_COUNT=$(sqlite3 /pb_data/data.db "SELECT COUNT(*) FROM _admins WHERE email = '$(printf "%s" "$PB_ADMIN_EMAIL" | sed "s/'/''/g")';" 2>/dev/null || echo 0)
-  if [ "${EMAIL_COUNT:-0}" -gt 0 ]; then
-    echo "[admin] Updating password for $PB_ADMIN_EMAIL"
-    /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-      admin update "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_update.log 2>&1 || true
-    echo "[admin] update output:"; cat /tmp/pb_admin_update.log || true
-  else
-    echo "[admin] Provided PB_ADMIN_EMAIL not found; leaving existing admins unchanged."
-  fi
-else
+if [ "${ADMINS_TOTAL:-0}" -eq 0 ]; then
   echo "[admin] No admins found; creating $PB_ADMIN_EMAIL"
   /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
     admin create "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_create.log 2>&1 || true
   echo "[admin] create output:"; cat /tmp/pb_admin_create.log || true
+
+elif [ "${EMAIL_COUNT:-0}" -gt 0 ]; then
+  echo "[admin] Env admin already exists."
+  if [ "$PB_ADMIN_FORCE_UPDATE_PASSWORD" = "true" ]; then
+    echo "[admin] PB_ADMIN_FORCE_UPDATE_PASSWORD=true → rotating password"
+    /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
+      admin update "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_update.log 2>&1 || true
+    echo "[admin] update output:"; cat /tmp/pb_admin_update.log || true
+  else
+    echo "[admin] PB_ADMIN_FORCE_UPDATE_PASSWORD=false → leaving password unchanged (sessions stay valid)."
+  fi
+
+else
+  # There are admins, but not the env one
+  if [ "$PB_ADMIN_ENFORCE_SINGLE" = "true" ]; then
+    echo "[admin] Admin(s) exist but not '$PB_ADMIN_EMAIL' → enforcing single admin: deleting all others."
+    # List all admin emails and delete each
+    # (tokens for those admins will become invalid)
+    for em in $(sqlite3 -newline $'\n' /pb_data/data.db "SELECT email FROM _admins;"); do
+      if [ "$em" != "$PB_ADMIN_EMAIL" ]; then
+        echo "[admin] Deleting admin: $em"
+        /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
+          admin delete "$em" >/tmp/pb_admin_delete.log 2>&1 || true
+      fi
+    done
+    echo "[admin] Ensuring env admin exists after deletion."
+    /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
+      admin create "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_create.log 2>&1 || true
+    echo "[admin] create output:"; cat /tmp/pb_admin_create.log || true
+  else
+    echo "[admin] PB_ADMIN_ENFORCE_SINGLE=false → leaving existing admins untouched."
+  fi
 fi
 
 ############################################
@@ -173,7 +199,7 @@ if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
   exit 1
 fi
 
-# ---------- Build JSON to files ----------
+# Build JSON to files
 META_FILE="$(mktemp)"
 jq -n --arg url "$PB_PUBLIC_URL" '{meta:{appName:"PocketBase",appUrl:$url}}' > "$META_FILE"
 
