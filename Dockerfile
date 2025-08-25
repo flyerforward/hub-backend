@@ -22,8 +22,5 @@ RUN chmod +x /app/entrypoint.sh
 # Create volume mount points (populated at runtime by entrypoint)
 RUN mkdir -p /pb_data /pb_migrations
 
-# Declare data & migrations as volumes
-VOLUME ["/pb_data", "/pb_migrations"]
-
 EXPOSE 8090
 CMD ["/app/entrypoint.sh"]

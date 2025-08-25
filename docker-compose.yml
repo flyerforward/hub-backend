@@ -1,0 +1,39 @@
+services:
+  pocketbase:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pocketbase
+    command: ["/app/entrypoint.sh"]
+    environment:
+      # Dokploy will inject your .env automatically if configured
+      PB_ADMIN_EMAIL: ${PB_ADMIN_EMAIL}
+      PB_ADMIN_PASSWORD: ${PB_ADMIN_PASSWORD}
+      PB_PUBLIC_URL: ${PB_PUBLIC_URL}
+      PB_ENCRYPTION: ${PB_ENCRYPTION}
+      PB_BACKUP_BUCKET_URL: ${PB_BACKUP_BUCKET_URL}
+      PB_S3_STORAGE_BUCKET: ${PB_S3_STORAGE_BUCKET}
+      PB_S3_STORAGE_REGION: ${PB_S3_STORAGE_REGION}
+      PB_S3_STORAGE_ENDPOINT: ${PB_S3_STORAGE_ENDPOINT}
+      PB_S3_STORAGE_ACCESS_KEY: ${PB_S3_STORAGE_ACCESS_KEY}
+      PB_S3_STORAGE_SECRET: ${PB_S3_STORAGE_SECRET}
+      PB_S3_STORAGE_FORCE_PATH_STYLE: ${PB_S3_STORAGE_FORCE_PATH_STYLE}
+      PB_S3_BACKUPS_BUCKET: ${PB_S3_BACKUPS_BUCKET}
+      PB_S3_BACKUPS_REGION: ${PB_S3_BACKUPS_REGION}
+      PB_S3_BACKUPS_ENDPOINT: ${PB_S3_BACKUPS_ENDPOINT}
+      PB_S3_BACKUPS_ACCESS_KEY: ${PB_S3_BACKUPS_ACCESS_KEY}
+      PB_S3_BACKUPS_SECRET: ${PB_S3_BACKUPS_SECRET}
+      PB_S3_BACKUPS_FORCE_PATH_STYLE: ${PB_S3_BACKUPS_FORCE_PATH_STYLE}
+      PB_BACKUPS_CRON: ${PB_BACKUPS_CRON}
+      PB_BACKUPS_MAX_KEEP: ${PB_BACKUPS_MAX_KEEP}
+      AWS_REGION: ${AWS_REGION}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    ports:
+      - "8090:8090"
+    volumes:
+      - pb_data:/pb_data
+      # You typically don't need to persist /pb_migrations unless you generate them at runtime
+
+volumes:
+  pb_data: {}
