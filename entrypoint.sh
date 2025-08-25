@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -euo pipefail
 
-echo "[boot] entrypoint v7.18 (stateless + explicit restore only) loaded"
+echo "[boot] entrypoint v7.19 (stateless + always-restore-when-specified) loaded"
 
 ############################################
 # Env
@@ -39,9 +39,9 @@ PB_S3_BACKUPS_FORCE_PATH_STYLE="${PB_S3_BACKUPS_FORCE_PATH_STYLE:-false}"
 PB_BACKUPS_CRON="${PB_BACKUPS_CRON:-0 3 * * *}"
 PB_BACKUPS_MAX_KEEP="${PB_BACKUPS_MAX_KEEP:-7}"
 
-# Explicit restore only
+# Explicit restore only (no auto-latest fallback)
 PB_BACKUP_BUCKET_URL="${PB_BACKUP_BUCKET_URL:-}"
-PB_RESTORE_OBJECT="${PB_RESTORE_OBJECT:-}"   # Filename or full s3:// URL
+PB_RESTORE_OBJECT="${PB_RESTORE_OBJECT:-}"   # Filename under PB_BACKUP_BUCKET_URL or full s3:// URL
 
 # AWS (Wasabi)
 AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -76,7 +76,8 @@ _restore_from_zip() {
     cp -a /tmp/pb_restore/. /pb_data/
     echo "[restore] Restore completed."
   else
-    echo "[restore] Required files not found at archive root; skipping restore."
+    echo "[restore] Required files not found at archive root; restore aborted."
+    return 1
   fi
   rm -rf "$zip_path" /tmp/pb_restore
 }
@@ -87,9 +88,10 @@ _s3_object_exists() {
 }
 
 ############################################
-# Restore (explicit only)
+# Restore (ALWAYS when PB_RESTORE_OBJECT is set & exists)
 ############################################
-if [ ! -f /pb_data/data.db ] && [ -n "$PB_RESTORE_OBJECT" ]; then
+if [ -n "$PB_RESTORE_OBJECT" ]; then
+  # Resolve RESTORE_URL from env
   if printf "%s" "$PB_RESTORE_OBJECT" | grep -q '^s3://'; then
     RESTORE_URL="$PB_RESTORE_OBJECT"
   else
@@ -102,12 +104,46 @@ if [ ! -f /pb_data/data.db ] && [ -n "$PB_RESTORE_OBJECT" ]; then
   fi
 
   if [ -n "${RESTORE_URL:-}" ] && _s3_object_exists "$RESTORE_URL"; then
+    # Backup existing data (if any), then restore
+    if [ -d /pb_data ] && [ "$(ls -A /pb_data 2>/dev/null | wc -l)" -gt 0 ]; then
+      TS="$(date +%Y%m%d-%H%M%S)"
+      BACKUP_DIR="/pb_data._pre_restore_$TS"
+      echo "[restore] Backing up existing /pb_data to $BACKUP_DIR"
+      mkdir -p "$BACKUP_DIR"
+      find /pb_data -mindepth 1 -maxdepth 1 -exec mv {} "$BACKUP_DIR"/ \;
+    fi
+
     echo "[restore] Restoring explicit object: $RESTORE_URL"
-    aws --endpoint-url "$AWS_S3_ENDPOINT" s3 cp "$RESTORE_URL" /tmp/pb_backup.zip
-    _restore_from_zip /tmp/pb_backup.zip
+    if aws --endpoint-url "$AWS_S3_ENDPOINT" s3 cp "$RESTORE_URL" /tmp/pb_backup.zip; then
+      mkdir -p /pb_data
+      if ! _restore_from_zip /tmp/pb_backup.zip; then
+        echo "[restore] Restore failed; attempting to revert previous data if backup exists."
+        if [ -d "${BACKUP_DIR:-}" ]; then
+          find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -exec mv {} /pb_data/ \;
+          rmdir "$BACKUP_DIR" 2>/dev/null || true
+          echo "[restore] Reverted to previous data."
+        fi
+      else
+        # restore succeeded; clean up backup dir (optional, keep if you want)
+        :
+      fi
+    else
+      echo "[restore] Failed to download $RESTORE_URL"
+      # try to revert if we moved data out
+      if [ -d "${BACKUP_DIR:-}" ]; then
+        find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -exec mv {} /pb_data/ \;
+        rmdir "$BACKUP_DIR" 2>/dev/null || true
+        echo "[restore] Reverted to previous data."
+      fi
+    fi
   else
     echo "[restore] Specified PB_RESTORE_OBJECT not found: ${RESTORE_URL:-<unset>}"
-    echo "[restore] Starting fresh."
+    echo "[restore] Continuing with existing data."
+  fi
+else
+  # No restore requested; do nothing (start fresh if empty, keep existing otherwise)
+  if [ ! -f /pb_data/data.db ]; then
+    echo "[restore] No PB_RESTORE_OBJECT and no data.db → starting fresh."
   fi
 fi
 
