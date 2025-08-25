@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -euo pipefail
 
-echo "[boot] entrypoint v7.9 loaded"
+echo "[boot] entrypoint v7.10 loaded"
 
 ############################################
 # Env
@@ -62,7 +62,6 @@ fi
 # Tools & dirs
 ############################################
 apk add --no-cache aws-cli unzip curl jq rsync sqlite >/dev/null 2>&1 || true
-
 mkdir -p /pb_data /pb_migrations
 [ -d /app/pb_migrations ] && rsync -a --update /app/pb_migrations/ /pb_migrations/
 
@@ -99,9 +98,7 @@ fi
 INIT_PORT=8097
 echo "[init] Starting PB once on :${INIT_PORT} to initialize core/migrations…"
 /app/pocketbase $ENCRYPTION_ARG \
-  --dev --dir /pb_data \
-  --hooksDir /app/pb_hooks \
-  --migrationsDir /pb_migrations \
+  --dev --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
   serve --http 127.0.0.1:${INIT_PORT} >/tmp/pb_init.log 2>&1 &
 INIT_PID=$!
 
@@ -127,10 +124,8 @@ if [ "${ADMINS_TOTAL:-0}" -eq 0 ]; then
   /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
     admin create "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_create.log 2>&1 || true
   echo "[admin] create output:"; cat /tmp/pb_admin_create.log || true
-
 elif [ "${EMAIL_COUNT:-0}" -gt 0 ]; then
   echo "[admin] Env admin already exists; will not rotate password unless needed."
-
 else
   if [ "$PB_ADMIN_ENFORCE_SINGLE" = "true" ]; then
     echo "[admin] Admin(s) exist but not '$PB_ADMIN_EMAIL' → enforcing single admin: deleting all others."
@@ -151,79 +146,76 @@ else
 fi
 
 ############################################
-# Compare desired settings vs current (avoid login if no change)
+# Build "desired" settings as files (no inline jq)
 ############################################
-# Build the "desired" JSON we would set
-DESIRED_META="$(jq -n --arg url "$PB_PUBLIC_URL" '{meta:{appName:"PocketBase",appUrl:$url}}')"
+META_FILE="$(mktemp)"; STOR_FILE="$(mktemp)"; BACK_FILE="$(mktemp)"
+jq -n --arg url "$PB_PUBLIC_URL" '{meta:{appName:"PocketBase",appUrl:$url}}' > "$META_FILE"
 
-DESIRED_S3="{}"
-if [ "$PB_S3_STORAGE_ENABLED" = "true" ] && [ -n "$PB_S3_STORAGE_BUCKET" ] \
-   && [ -n "$PB_S3_STORAGE_REGION" ] && [ -n "$PB_S3_STORAGE_ENDPOINT" ] \
-   && [ -n "$PB_S3_STORAGE_ACCESS_KEY" ] && [ -n "$PB_S3_STORAGE_SECRET" ]; then
-  DESIRED_S3="$(jq -n \
-    --arg b "$PB_S3_STORAGE_BUCKET" --arg r "$PB_S3_STORAGE_REGION" \
-    --arg e "$PB_S3_STORAGE_ENDPOINT" --arg ak "$PB_S3_STORAGE_ACCESS_KEY" \
-    --arg sk "$PB_S3_STORAGE_SECRET" --argjson fps "$PB_S3_STORAGE_FORCE_PATH_STYLE" \
-    '{s3:{enabled:true,bucket:$b,region:$r,endpoint:$e,accessKey:$ak,secret:$sk,forcePathStyle:$fps}}')"
+if [ "$PB_S3_STORAGE_ENABLED" = "true" ] \
+   && [ -n "$PB_S3_STORAGE_BUCKET" ] && [ -n "$PB_S3_STORAGE_REGION" ] \
+   && [ -n "$PB_S3_STORAGE_ENDPOINT" ] && [ -n "$PB_S3_STORAGE_ACCESS_KEY" ] \
+   && [ -n "$PB_S3_STORAGE_SECRET" ]; then
+  jq -n \
+    --arg b  "$PB_S3_STORAGE_BUCKET" \
+    --arg r  "$PB_S3_STORAGE_REGION" \
+    --arg e  "$PB_S3_STORAGE_ENDPOINT" \
+    --arg ak "$PB_S3_STORAGE_ACCESS_KEY" \
+    --arg sk "$PB_S3_STORAGE_SECRET" \
+    --argjson fps "$PB_S3_STORAGE_FORCE_PATH_STYLE" \
+    '{s3:{enabled:true,bucket:$b,region:$r,endpoint:$e,accessKey:$ak,secret:$sk,forcePathStyle:$fps}}' > "$STOR_FILE"
+else
+  echo '{}' > "$STOR_FILE"
 fi
 
-DESIRED_BACKUPS="{}"
-if [ "$PB_S3_BACKUPS_ENABLED" = "true" ] && [ -n "$PB_S3_BACKUPS_BUCKET" ] \
-   && [ -n "$PB_S3_BACKUPS_REGION" ] && [ -n "$PB_S3_BACKUPS_ENDPOINT" ] \
-   && [ -n "$PB_S3_BACKUPS_ACCESS_KEY" ] && [ -n "$PB_S3_BACKUPS_SECRET" ] \
-   && [ -n "$PB_BACKUPS_CRON" ] && [ -n "$PB_BACKUPS_MAX_KEEP" ]; then
-  DESIRED_BACKUPS="$(jq -n \
-    --arg cron "$PB_BACKUPS_CRON" --argjson keep "$PB_BACKUPS_MAX_KEEP" \
-    --arg b "$PB_S3_BACKUPS_BUCKET" --arg r "$PB_S3_BACKUPS_REGION" \
-    --arg e "$PB_S3_BACKUPS_ENDPOINT" --arg ak "$PB_S3_BACKUPS_ACCESS_KEY" \
-    --arg sk "$PB_S3_BACKUPS_SECRET" --argjson fps "$PB_S3_BACKUPS_FORCE_PATH_STYLE" \
-    '{backups:{cron:$cron,cronMaxKeep:($keep|tonumber),s3:{enabled:true,bucket:$b,region:$r,endpoint:$e,accessKey:$ak,secret:$sk,forcePathStyle:$fps}}')"
+if [ "$PB_S3_BACKUPS_ENABLED" = "true" ] \
+   && [ -n "$PB_S3_BACKUPS_BUCKET" ] && [ -n "$PB_S3_BACKUPS_REGION" ] \
+   && [ -n "$PB_S3_BACKUPS_ENDPOINT" ] && [ -n "$PB_S3_BACKUPS_ACCESS_KEY" ] \
+   && [ -n "$PB_S3_BACKUPS_SECRET" ] && [ -n "$PB_BACKUPS_CRON" ] && [ -n "$PB_BACKUPS_MAX_KEEP" ]; then
+  # ensure keep is numeric to jq
+  jq -n \
+    --arg cron "$PB_BACKUPS_CRON" \
+    --argjson keep "$(printf '%s' "$PB_BACKUPS_MAX_KEEP")" \
+    --arg b  "$PB_S3_BACKUPS_BUCKET" \
+    --arg r  "$PB_S3_BACKUPS_REGION" \
+    --arg e  "$PB_S3_BACKUPS_ENDPOINT" \
+    --arg ak "$PB_S3_BACKUPS_ACCESS_KEY" \
+    --arg sk "$PB_S3_BACKUPS_SECRET" \
+    --argjson fps "$PB_S3_BACKUPS_FORCE_PATH_STYLE" \
+    '{backups:{cron:$cron,cronMaxKeep:$keep,s3:{enabled:true,bucket:$b,region:$r,endpoint:$e,accessKey:$ak,secret:$sk,forcePathStyle:$fps}}}' > "$BACK_FILE"
+else
+  echo '{}' > "$BACK_FILE"
 fi
 
-DESIRED="$(jq -s 'add' \
-  <(echo "$DESIRED_META") \
-  <(echo "$DESIRED_S3") \
-  <(echo "$DESIRED_BACKUPS"))"
+DESIRED_FILE="$(mktemp)"
+jq -s 'add' "$META_FILE" "$STOR_FILE" "$BACK_FILE" > "$DESIRED_FILE"
 
-# Read current settings JSON directly from the DB (_params key='settings')
+############################################
+# Compare desired vs current (avoid login if no change)
+############################################
 CURRENT_RAW="$(sqlite3 /pb_data/data.db "SELECT value FROM _params WHERE key='settings' LIMIT 1;" 2>/dev/null || echo '')"
 if [ -z "$CURRENT_RAW" ]; then
   echo "[settings] No existing settings row; will apply desired settings."
   NEEDS_PATCH="yes"
 else
-  # Normalize both to the subset we manage to avoid diff noise
-  CURRENT_TRIM="$(echo "$CURRENT_RAW" | jq '{meta: {appUrl: .meta.appUrl}, s3, backups}')"
-  DESIRED_TRIM="$(echo "$DESIRED"     | jq '{meta: {appUrl: .meta.appUrl}, s3, backups}')"
-
-  if diff -u <(echo "$CURRENT_TRIM" | jq -S .) <(echo "$DESIRED_TRIM" | jq -S .) >/dev/null 2>&1; then
+  CURRENT_TRIM="$(printf '%s' "$CURRENT_RAW" | jq '{meta:{appUrl:.meta.appUrl}, s3, backups}')"
+  DESIRED_TRIM="$(jq '{meta:{appUrl:.meta.appUrl}, s3, backups}' "$DESIRED_FILE")"
+  if diff -u <(printf '%s' "$CURRENT_TRIM" | jq -S .) <(printf '%s' "$DESIRED_TRIM" | jq -S .) >/dev/null 2>&1; then
     echo "[settings] Current settings already match desired. Skipping admin login & PATCH."
-    NEEDS_PATCH="no"
+    exec /app/pocketbase $ENCRYPTION_ARG \
+      --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
+      serve --http 0.0.0.0:8090
   else
     echo "[settings] Settings differ; will login and PATCH."
-    NEEDS_PATCH="yes"
   fi
 fi
 
 ############################################
-# If no changes → start real server (no login = no logout)
-############################################
-if [ "${NEEDS_PATCH:-yes}" = "no" ]; then
-  exec /app/pocketbase $ENCRYPTION_ARG \
-    --dir /pb_data \
-    --hooksDir /app/pb_hooks \
-    --migrationsDir /pb_migrations \
-    serve --http 0.0.0.0:8090
-fi
-
-############################################
-# Changes needed → temp server, auth, (update password if needed), PATCH
+# Temp server for settings & conditional password update
 ############################################
 BOOT_PORT=8099
 echo "[bootstrap] Starting temporary PB on :${BOOT_PORT} for settings (changes pending)…"
 /app/pocketbase $ENCRYPTION_ARG \
-  --dev --dir /pb_data \
-  --hooksDir /app/pb_hooks \
-  --migrationsDir /pb_migrations \
+  --dev --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
   serve --http 127.0.0.1:${BOOT_PORT} >/tmp/pb_bootstrap.log 2>&1 &
 PB_PID=$!
 
@@ -260,29 +252,25 @@ else
   echo "[admin] Env password matches DB."
 fi
 
-# Apply desired settings
+# PATCH settings
 PATCH_OUT="$(mktemp)"; PATCH_CODE=0
-echo "$DESIRED" | curl -sS -w "%{http_code}" -o "$PATCH_OUT" \
+cat "$DESIRED_FILE" | curl -sS -w "%{http_code}" -o "$PATCH_OUT" \
   -X PATCH "http://127.0.0.1:${BOOT_PORT}/api/settings" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
   --data-binary @- > /tmp/pb_patch_code.txt || PATCH_CODE=$?
 HTTP_CODE="$(cat /tmp/pb_patch_code.txt || echo 000)"
-
 if [ "$PATCH_CODE" -ne 0 ] || [ "$HTTP_CODE" -ge 400 ]; then
   echo "[bootstrap] Settings PATCH failed (HTTP $HTTP_CODE). Response:"; cat "$PATCH_OUT"
   echo "--- bootstrap.log (tail) ---"; tail -n 200 /tmp/pb_bootstrap.log || true
   kill $PB_PID; wait $PB_PID 2>/dev/null || true
   exit 1
 fi
-rm -f "$PATCH_OUT" /tmp/pb_patch_code.txt
 
-# Stop temp PB and start the real server
+# Cleanup temp files & start real server
+rm -f "$META_FILE" "$STOR_FILE" "$BACK_FILE" "$DESIRED_FILE" "$PATCH_OUT" /tmp/pb_patch_code.txt 2>/dev/null || true
 kill $PB_PID; wait $PB_PID 2>/dev/null || true
 echo "[bootstrap] Settings configured."
 
 exec /app/pocketbase $ENCRYPTION_ARG \
-  --dir /pb_data \
-  --hooksDir /app/pb_hooks \
-  --migrationsDir /pb_migrations \
+  --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
   serve --http 0.0.0.0:8090
