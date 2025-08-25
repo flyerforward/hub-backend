@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -euo pipefail
 
-echo "[boot] entrypoint v7.19 (stateless + always-restore-when-specified) loaded"
+echo "[boot] entrypoint v7.20 (stateless + always-restore-when-specified + robust ZIP) loaded"
 
 ############################################
 # Env
@@ -68,18 +68,36 @@ wal_ckpt() { sqlite3 /pb_data/data.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/n
 ############################################
 # Restore helpers
 ############################################
-_restore_from_zip() {
+_restore_from_zip_any_layout() {
+  # Accepts a zip path, extracts, finds data.db in common layouts, and rsyncs that dir into /pb_data
   local zip_path="$1"
-  unzip -o "$zip_path" -d /tmp/pb_restore
-  if [ -f /tmp/pb_restore/data.db ]; then
-    echo "[restore] Using 'root files' layout from archive."
-    cp -a /tmp/pb_restore/. /pb_data/
-    echo "[restore] Restore completed."
-  else
-    echo "[restore] Required files not found at archive root; restore aborted."
+  local tmpdir="/tmp/pb_restore"
+  rm -rf "$tmpdir"
+  mkdir -p "$tmpdir"
+
+  unzip -o "$zip_path" -d "$tmpdir" >/dev/null
+
+  # Look for data.db at root, one dir deep, or two dirs deep (covers pb_data/, single-folder zips, etc.)
+  local data_path
+  data_path="$(find "$tmpdir" -maxdepth 3 -type f -name 'data.db' | head -n1 || true)"
+
+  if [ -z "$data_path" ]; then
+    echo "[restore] ERROR: data.db not found in archive."
+    rm -rf "$zip_path" "$tmpdir"
     return 1
   fi
-  rm -rf "$zip_path" /tmp/pb_restore
+
+  local src_dir
+  src_dir="$(dirname "$data_path")"
+
+  echo "[restore] Found data root: $src_dir"
+  mkdir -p /pb_data
+
+  # Use rsync to copy the *contents* of src_dir into /pb_data (preserve perms, overwrite existing)
+  rsync -a --delete "$src_dir"/ /pb_data/
+
+  rm -rf "$zip_path" "$tmpdir"
+  return 0
 }
 
 _s3_object_exists() {
@@ -96,49 +114,53 @@ if [ -n "$PB_RESTORE_OBJECT" ]; then
     RESTORE_URL="$PB_RESTORE_OBJECT"
   else
     if [ -z "$PB_BACKUP_BUCKET_URL" ]; then
-      echo "[restore] PB_RESTORE_OBJECT provided but PB_BACKUP_BUCKET_URL is empty; cannot resolve key."
-      RESTORE_URL=""
-    else
-      RESTORE_URL="${PB_BACKUP_BUCKET_URL%/}/$PB_RESTORE_OBJECT"
+      echo "[restore] ERROR: PB_RESTORE_OBJECT is set but PB_BACKUP_BUCKET_URL is empty; cannot resolve key."
+      exit 1
     fi
+    RESTORE_URL="${PB_BACKUP_BUCKET_URL%/}/$PB_RESTORE_OBJECT"
   fi
 
-  if [ -n "${RESTORE_URL:-}" ] && _s3_object_exists "$RESTORE_URL"; then
-    # Backup existing data (if any), then restore
-    if [ -d /pb_data ] && [ "$(ls -A /pb_data 2>/dev/null | wc -l)" -gt 0 ]; then
-      TS="$(date +%Y%m%d-%H%M%S)"
-      BACKUP_DIR="/pb_data._pre_restore_$TS"
-      echo "[restore] Backing up existing /pb_data to $BACKUP_DIR"
-      mkdir -p "$BACKUP_DIR"
-      find /pb_data -mindepth 1 -maxdepth 1 -exec mv {} "$BACKUP_DIR"/ \;
-    fi
+  echo "[restore] PB_RESTORE_OBJECT set. Resolved URL: ${RESTORE_URL:-<unset>}"
+  if [ -z "${RESTORE_URL:-}" ] || ! _s3_object_exists "$RESTORE_URL"; then
+    echo "[restore] ERROR: Specified object not found: ${RESTORE_URL:-<unset>}"
+    exit 1
+  fi
 
-    echo "[restore] Restoring explicit object: $RESTORE_URL"
-    if aws --endpoint-url "$AWS_S3_ENDPOINT" s3 cp "$RESTORE_URL" /tmp/pb_backup.zip; then
-      mkdir -p /pb_data
-      if ! _restore_from_zip /tmp/pb_backup.zip; then
-        echo "[restore] Restore failed; attempting to revert previous data if backup exists."
-        if [ -d "${BACKUP_DIR:-}" ]; then
-          find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -exec mv {} /pb_data/ \;
-          rmdir "$BACKUP_DIR" 2>/dev/null || true
-          echo "[restore] Reverted to previous data."
-        fi
-      else
-        # restore succeeded; clean up backup dir (optional, keep if you want)
-        :
-      fi
-    else
-      echo "[restore] Failed to download $RESTORE_URL"
-      # try to revert if we moved data out
-      if [ -d "${BACKUP_DIR:-}" ]; then
-        find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -exec mv {} /pb_data/ \;
-        rmdir "$BACKUP_DIR" 2>/dev/null || true
-        echo "[restore] Reverted to previous data."
-      fi
+  # Backup existing data (if any), then restore
+  if [ -d /pb_data ] && [ "$(ls -A /pb_data 2>/dev/null | wc -l)" -gt 0 ]; then
+    TS="$(date +%Y%m%d-%H%M%S)"
+    BACKUP_DIR="/pb_data._pre_restore_$TS"
+    echo "[restore] Backing up existing /pb_data to $BACKUP_DIR"
+    mkdir -p "$BACKUP_DIR"
+    find /pb_data -mindepth 1 -maxdepth 1 -exec mv {} "$BACKUP_DIR"/ \;
+  fi
+
+  echo "[restore] Downloading: $RESTORE_URL"
+  if ! aws --endpoint-url "$AWS_S3_ENDPOINT" s3 cp "$RESTORE_URL" /tmp/pb_backup.zip; then
+    echo "[restore] ERROR: Download failed."
+    # Try to revert if we moved data out
+    if [ -d "${BACKUP_DIR:-}" ]; then
+      find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -exec mv {} /pb_data/ \;
+      rmdir "$BACKUP_DIR" 2>/dev/null || true
+      echo "[restore] Reverted to previous data."
     fi
-  else
-    echo "[restore] Specified PB_RESTORE_OBJECT not found: ${RESTORE_URL:-<unset>}"
-    echo "[restore] Continuing with existing data."
+    exit 1
+  fi
+
+  echo "[restore] Applying archive to /pb_data (robust layout detection)…"
+  if ! _restore_from_zip_any_layout /tmp/pb_backup.zip; then
+    echo "[restore] ERROR: Restore failed; attempting to revert previous data."
+    if [ -d "${BACKUP_DIR:-}" ]; then
+      find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -exec mv {} /pb_data/ \;
+      rmdir "$BACKUP_DIR" 2>/dev/null || true
+      echo "[restore] Reverted to previous data."
+    fi
+    exit 1
+  fi
+
+  # Optional: clean up pre-restore backup dir (comment out to keep)
+  if [ -d "${BACKUP_DIR:-}" ]; then
+    echo "[restore] Keeping pre-restore data at: $BACKUP_DIR"
   fi
 else
   # No restore requested; do nothing (start fresh if empty, keep existing otherwise)
