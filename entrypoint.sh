@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -euo pipefail
 
-echo "[boot] entrypoint v7.7 loaded"
+echo "[boot] entrypoint v7.8 loaded"
 
 ############################################
 # Env
@@ -9,11 +9,8 @@ echo "[boot] entrypoint v7.7 loaded"
 : "${PB_ADMIN_EMAIL:?Set PB_ADMIN_EMAIL}"
 : "${PB_ADMIN_PASSWORD:?Set PB_ADMIN_PASSWORD}"
 
-# Delete any non-matching admins and replace with env admin (dangerous, but requested)
+# Keep only the env admin (delete others) if true
 PB_ADMIN_ENFORCE_SINGLE="${PB_ADMIN_ENFORCE_SINGLE:-true}"
-
-# Avoid logging out: don't rotate password unless explicitly requested
-PB_ADMIN_FORCE_UPDATE_PASSWORD="${PB_ADMIN_FORCE_UPDATE_PASSWORD:-false}"
 
 PB_ENCRYPTION="${PB_ENCRYPTION:-}"
 ENCRYPTION_ARG=""
@@ -31,7 +28,7 @@ PB_S3_STORAGE_ACCESS_KEY="${PB_S3_STORAGE_ACCESS_KEY:-}"
 PB_S3_STORAGE_SECRET="${PB_S3_STORAGE_SECRET:-}"
 PB_S3_STORAGE_FORCE_PATH_STYLE="${PB_S3_STORAGE_FORCE_PATH_STYLE:-false}"
 
-# S3 backups (scheduled by PB)
+# S3 backups (PocketBase cron)
 PB_S3_BACKUPS_ENABLED="${PB_S3_BACKUPS_ENABLED:-true}"
 PB_S3_BACKUPS_BUCKET="${PB_S3_BACKUPS_BUCKET:-}"
 PB_S3_BACKUPS_REGION="${PB_S3_BACKUPS_REGION:-}"
@@ -70,7 +67,7 @@ mkdir -p /pb_data /pb_migrations
 [ -d /app/pb_migrations ] && rsync -a --update /app/pb_migrations/ /pb_migrations/
 
 ############################################
-# First boot: restore from Wasabi (root-files layout only)
+# First boot restore (root-files layout only)
 ############################################
 if [ ! -f /pb_data/data.db ] && [ "$PB_RESTORE_FROM_S3" = "true" ] && [ -n "$PB_BACKUP_BUCKET_URL" ]; then
   echo "[restore] No data.db; attempting restore from $PB_BACKUP_BUCKET_URL"
@@ -86,7 +83,7 @@ if [ ! -f /pb_data/data.db ] && [ "$PB_RESTORE_FROM_S3" = "true" ] && [ -n "$PB_
     if [ -f /tmp/pb_restore/data.db ]; then
       echo "[restore] Using 'root files' layout from archive."
       cp -a /tmp/pb_restore/. /pb_data/
-      echo "[restore] Restore completed from root layout."
+      echo "[restore] Restore completed."
     else
       echo "[restore] Required files not found at archive root; skipping restore."
     fi
@@ -135,22 +132,11 @@ if [ "${ADMINS_TOTAL:-0}" -eq 0 ]; then
   echo "[admin] create output:"; cat /tmp/pb_admin_create.log || true
 
 elif [ "${EMAIL_COUNT:-0}" -gt 0 ]; then
-  echo "[admin] Env admin already exists."
-  if [ "$PB_ADMIN_FORCE_UPDATE_PASSWORD" = "true" ]; then
-    echo "[admin] PB_ADMIN_FORCE_UPDATE_PASSWORD=true → rotating password"
-    /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-      admin update "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_update.log 2>&1 || true
-    echo "[admin] update output:"; cat /tmp/pb_admin_update.log || true
-  else
-    echo "[admin] PB_ADMIN_FORCE_UPDATE_PASSWORD=false → leaving password unchanged (sessions stay valid)."
-  fi
+  echo "[admin] Env admin already exists; not touching password yet."
 
 else
-  # There are admins, but not the env one
   if [ "$PB_ADMIN_ENFORCE_SINGLE" = "true" ]; then
     echo "[admin] Admin(s) exist but not '$PB_ADMIN_EMAIL' → enforcing single admin: deleting all others."
-    # List all admin emails and delete each
-    # (tokens for those admins will become invalid)
     for em in $(sqlite3 -newline $'\n' /pb_data/data.db "SELECT email FROM _admins;"); do
       if [ "$em" != "$PB_ADMIN_EMAIL" ]; then
         echo "[admin] Deleting admin: $em"
@@ -158,17 +144,17 @@ else
           admin delete "$em" >/tmp/pb_admin_delete.log 2>&1 || true
       fi
     done
-    echo "[admin] Ensuring env admin exists after deletion."
+    echo "[admin] Creating env admin after deletion."
     /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
       admin create "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_create.log 2>&1 || true
     echo "[admin] create output:"; cat /tmp/pb_admin_create.log || true
   else
-    echo "[admin] PB_ADMIN_ENFORCE_SINGLE=false → leaving existing admins untouched."
+    echo "[admin] PB_ADMIN_ENFORCE_SINGLE=false → leaving existing admins."
   fi
 fi
 
 ############################################
-# Bootstrap settings (S3 storage + backups) via API
+# Temp server for settings (and password check)
 ############################################
 BOOT_PORT=8099
 echo "[bootstrap] Starting temporary PB on :${BOOT_PORT} for settings…"
@@ -186,20 +172,37 @@ for i in $(seq 1 120); do
   [ "$i" -eq 120 ] && echo "[bootstrap] PB failed to start" && tail -n 200 /tmp/pb_bootstrap.log && exit 1
 done
 
-# Auth
+# Try to authenticate with env creds; if it fails, update password to env and retry
 AUTH_BODY="$(jq -n --arg id "$PB_ADMIN_EMAIL" --arg pw "$PB_ADMIN_PASSWORD" '{identity:$id, password:$pw}')"
-AUTH_JSON="$(curl -sS -X POST "http://127.0.0.1:${BOOT_PORT}/api/admins/auth-with-password" \
-  -H "Content-Type: application/json" --data-binary "$AUTH_BODY" || true)"
+try_auth() {
+  curl -sS -X POST "http://127.0.0.1:${BOOT_PORT}/api/admins/auth-with-password" \
+    -H "Content-Type: application/json" --data-binary "$AUTH_BODY" || true
+}
+AUTH_JSON="$(try_auth)"
 ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
+
 if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
-  echo "[bootstrap] Failed to obtain admin token. Response:"
-  echo "$AUTH_JSON" | sed 's/"password":"[^"]*"/"password":"***"/'
-  echo "--- bootstrap.log (tail) ---"; tail -n 200 /tmp/pb_bootstrap.log || true
-  kill $PB_PID; wait $PB_PID 2>/dev/null || true
-  exit 1
+  echo "[admin] Env password didn’t match DB; updating password for $PB_ADMIN_EMAIL"
+  /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
+    admin update "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_update.log 2>&1 || true
+  echo "[admin] update output:"; cat /tmp/pb_admin_update.log || true
+
+  AUTH_JSON="$(try_auth)"
+  ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
+  if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
+    echo "[bootstrap] Auth still failing after password update. Response:"
+    echo "$AUTH_JSON" | sed 's/"password":"[^"]*"/"password":"***"/'
+    echo "--- bootstrap.log (tail) ---"; tail -n 200 /tmp/pb_bootstrap.log || true
+    kill $PB_PID; wait $PB_PID 2>/dev/null || true
+    exit 1
+  fi
+else
+  echo "[admin] Env password matches DB; leaving password unchanged (sessions stay valid)."
 fi
 
-# Build JSON to files
+############################################
+# Build & PATCH settings (S3 storage + backups)
+############################################
 META_FILE="$(mktemp)"
 jq -n --arg url "$PB_PUBLIC_URL" '{meta:{appName:"PocketBase",appUrl:$url}}' > "$META_FILE"
 
@@ -239,10 +242,8 @@ else
   echo '{}' > "$BACK_FILE"
 fi
 
-# Merge: meta + storage + backups
 SETTINGS_BODY="$(jq -s 'add' "$META_FILE" "$STOR_FILE" "$BACK_FILE")"
 
-# PATCH /api/settings
 PATCH_OUT="$(mktemp)"; PATCH_CODE=0
 echo "$SETTINGS_BODY" | curl -sS -w "%{http_code}" -o "$PATCH_OUT" \
   -X PATCH "http://127.0.0.1:${BOOT_PORT}/api/settings" \
