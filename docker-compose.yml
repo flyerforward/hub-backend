@@ -9,6 +9,7 @@ services:
       # Dokploy will inject your .env automatically if configured
       PB_ADMIN_EMAIL: ${PB_ADMIN_EMAIL}
       PB_ADMIN_PASSWORD: ${PB_ADMIN_PASSWORD}
+      PB_RESTORE_OBJECT: ${PB_RESTORE_OBJECT}
       PB_PUBLIC_URL: ${PB_PUBLIC_URL}
       PB_ENCRYPTION: ${PB_ENCRYPTION}
       PB_BACKUP_BUCKET_URL: ${PB_BACKUP_BUCKET_URL}
