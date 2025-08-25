@@ -1,7 +1,9 @@
 #!/usr/bin/env sh
 set -euo pipefail
 
-echo "[boot] entrypoint v7.20 (stateless + always-restore-when-specified + robust ZIP) loaded"
+[ "${PB_DEBUG:-false}" = "true" ] && set -x
+
+echo "[boot] entrypoint v7.21 (always-restore-when-specified, verbose) loaded"
 
 ############################################
 # Env
@@ -39,9 +41,9 @@ PB_S3_BACKUPS_FORCE_PATH_STYLE="${PB_S3_BACKUPS_FORCE_PATH_STYLE:-false}"
 PB_BACKUPS_CRON="${PB_BACKUPS_CRON:-0 3 * * *}"
 PB_BACKUPS_MAX_KEEP="${PB_BACKUPS_MAX_KEEP:-7}"
 
-# Explicit restore only (no auto-latest fallback)
+# Explicit restore only
 PB_BACKUP_BUCKET_URL="${PB_BACKUP_BUCKET_URL:-}"
-PB_RESTORE_OBJECT="${PB_RESTORE_OBJECT:-}"   # Filename under PB_BACKUP_BUCKET_URL or full s3:// URL
+PB_RESTORE_OBJECT="${PB_RESTORE_OBJECT:-}"   # filename under PB_BACKUP_BUCKET_URL or full s3:// URL
 
 # AWS (Wasabi)
 AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -58,6 +60,7 @@ ESC_EMAIL="$(printf "%s" "$PB_ADMIN_EMAIL" | sed "s/'/''/g")"
 ############################################
 # Tools & dirs
 ############################################
+# (If your base image already has these, you can remove this apk line.)
 apk add --no-cache aws-cli unzip curl jq rsync sqlite coreutils diffutils >/dev/null 2>&1 || true
 mkdir -p /pb_data /pb_migrations
 [ -d /app/pb_migrations ] && rsync -a --update /app/pb_migrations/ /pb_migrations/
@@ -69,7 +72,6 @@ wal_ckpt() { sqlite3 /pb_data/data.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/n
 # Restore helpers
 ############################################
 _restore_from_zip_any_layout() {
-  # Accepts a zip path, extracts, finds data.db in common layouts, and rsyncs that dir into /pb_data
   local zip_path="$1"
   local tmpdir="/tmp/pb_restore"
   rm -rf "$tmpdir"
@@ -77,10 +79,8 @@ _restore_from_zip_any_layout() {
 
   unzip -o "$zip_path" -d "$tmpdir" >/dev/null
 
-  # Look for data.db at root, one dir deep, or two dirs deep (covers pb_data/, single-folder zips, etc.)
   local data_path
   data_path="$(find "$tmpdir" -maxdepth 3 -type f -name 'data.db' | head -n1 || true)"
-
   if [ -z "$data_path" ]; then
     echo "[restore] ERROR: data.db not found in archive."
     rm -rf "$zip_path" "$tmpdir"
@@ -89,11 +89,9 @@ _restore_from_zip_any_layout() {
 
   local src_dir
   src_dir="$(dirname "$data_path")"
-
   echo "[restore] Found data root: $src_dir"
-  mkdir -p /pb_data
 
-  # Use rsync to copy the *contents* of src_dir into /pb_data (preserve perms, overwrite existing)
+  mkdir -p /pb_data
   rsync -a --delete "$src_dir"/ /pb_data/
 
   rm -rf "$zip_path" "$tmpdir"
@@ -106,10 +104,10 @@ _s3_object_exists() {
 }
 
 ############################################
-# Restore (ALWAYS when PB_RESTORE_OBJECT is set & exists)
+# Always restore when PB_RESTORE_OBJECT is set
 ############################################
+echo "[env] PB_RESTORE_OBJECT=${PB_RESTORE_OBJECT:-<unset>}"
 if [ -n "$PB_RESTORE_OBJECT" ]; then
-  # Resolve RESTORE_URL from env
   if printf "%s" "$PB_RESTORE_OBJECT" | grep -q '^s3://'; then
     RESTORE_URL="$PB_RESTORE_OBJECT"
   else
@@ -120,13 +118,17 @@ if [ -n "$PB_RESTORE_OBJECT" ]; then
     RESTORE_URL="${PB_BACKUP_BUCKET_URL%/}/$PB_RESTORE_OBJECT"
   fi
 
-  echo "[restore] PB_RESTORE_OBJECT set. Resolved URL: ${RESTORE_URL:-<unset>}"
-  if [ -z "${RESTORE_URL:-}" ] || ! _s3_object_exists "$RESTORE_URL"; then
-    echo "[restore] ERROR: Specified object not found: ${RESTORE_URL:-<unset>}"
+  echo "[restore] Resolved restore URL: ${RESTORE_URL:-<unset>}"
+  echo "[restore] Checking object exists…"
+  if ! _s3_object_exists "$RESTORE_URL"; then
+    echo "[restore] ERROR: Specified object not found via aws s3 ls: $RESTORE_URL"
     exit 1
   fi
 
-  # Backup existing data (if any), then restore
+  echo "[restore] aws s3 ls sample:"
+  aws --endpoint-url "$AWS_S3_ENDPOINT" s3 ls "$RESTORE_URL" | head -n1 || true
+
+  # Backup existing data then restore
   if [ -d /pb_data ] && [ "$(ls -A /pb_data 2>/dev/null | wc -l)" -gt 0 ]; then
     TS="$(date +%Y%m%d-%H%M%S)"
     BACKUP_DIR="/pb_data._pre_restore_$TS"
@@ -135,19 +137,10 @@ if [ -n "$PB_RESTORE_OBJECT" ]; then
     find /pb_data -mindepth 1 -maxdepth 1 -exec mv {} "$BACKUP_DIR"/ \;
   fi
 
-  echo "[restore] Downloading: $RESTORE_URL"
-  if ! aws --endpoint-url "$AWS_S3_ENDPOINT" s3 cp "$RESTORE_URL" /tmp/pb_backup.zip; then
-    echo "[restore] ERROR: Download failed."
-    # Try to revert if we moved data out
-    if [ -d "${BACKUP_DIR:-}" ]; then
-      find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -exec mv {} /pb_data/ \;
-      rmdir "$BACKUP_DIR" 2>/dev/null || true
-      echo "[restore] Reverted to previous data."
-    fi
-    exit 1
-  fi
+  echo "[restore] Downloading archive…"
+  aws --endpoint-url "$AWS_S3_ENDPOINT" s3 cp "$RESTORE_URL" /tmp/pb_backup.zip
 
-  echo "[restore] Applying archive to /pb_data (robust layout detection)…"
+  echo "[restore] Applying archive to /pb_data…"
   if ! _restore_from_zip_any_layout /tmp/pb_backup.zip; then
     echo "[restore] ERROR: Restore failed; attempting to revert previous data."
     if [ -d "${BACKUP_DIR:-}" ]; then
@@ -158,12 +151,11 @@ if [ -n "$PB_RESTORE_OBJECT" ]; then
     exit 1
   fi
 
-  # Optional: clean up pre-restore backup dir (comment out to keep)
+  # Optional: keep pre-restore copy for inspection
   if [ -d "${BACKUP_DIR:-}" ]; then
-    echo "[restore] Keeping pre-restore data at: $BACKUP_DIR"
+    echo "[restore] Kept pre-restore data at: $BACKUP_DIR"
   fi
 else
-  # No restore requested; do nothing (start fresh if empty, keep existing otherwise)
   if [ ! -f /pb_data/data.db ]; then
     echo "[restore] No PB_RESTORE_OBJECT and no data.db → starting fresh."
   fi
@@ -291,8 +283,7 @@ if [ "$PB_ADMIN_ENFORCE_SINGLE" = "true" ]; then
 fi
 
 ############################################
-# Settings (STATELESS):
-#   Build desired JSON → GET live → trim both → compare → PATCH if different
+# Settings (STATELESS): compare & patch
 ############################################
 META_FILE="$(mktemp)"; STOR_FILE="$(mktemp)"; BACK_FILE="$(mktemp)"
 DESIRED_FILE="$(mktemp)"; DESIRED_TRIM_FILE="$(mktemp)"
