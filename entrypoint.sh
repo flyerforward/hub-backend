@@ -3,10 +3,10 @@ set -euo pipefail
 
 [ "${PB_DEBUG:-false}" = "true" ] && set -x
 
-echo "[boot] entrypoint v7.22 (stateless, hard-restore + WAL checkpoint) loaded"
+echo "[boot] entrypoint v7.23 (stateless, no PB_BACKUP_BUCKET_URL, per-op AWS creds) loaded"
 
 ############################################
-# Env
+# Env (required)
 ############################################
 : "${PB_ADMIN_EMAIL:?Set PB_ADMIN_EMAIL}"
 : "${PB_ADMIN_PASSWORD:?Set PB_ADMIN_PASSWORD}"
@@ -30,7 +30,7 @@ PB_S3_STORAGE_ACCESS_KEY="${PB_S3_STORAGE_ACCESS_KEY:-}"
 PB_S3_STORAGE_SECRET="${PB_S3_STORAGE_SECRET:-}"
 PB_S3_STORAGE_FORCE_PATH_STYLE="${PB_S3_STORAGE_FORCE_PATH_STYLE:-false}"
 
-# S3 backups (PocketBase cron)
+# S3 backups (PocketBase cron + explicit restore)
 PB_S3_BACKUPS_ENABLED="${PB_S3_BACKUPS_ENABLED:-true}"
 PB_S3_BACKUPS_BUCKET="${PB_S3_BACKUPS_BUCKET:-}"
 PB_S3_BACKUPS_REGION="${PB_S3_BACKUPS_REGION:-}"
@@ -41,20 +41,10 @@ PB_S3_BACKUPS_FORCE_PATH_STYLE="${PB_S3_BACKUPS_FORCE_PATH_STYLE:-false}"
 PB_BACKUPS_CRON="${PB_BACKUPS_CRON:-0 3 * * *}"
 PB_BACKUPS_MAX_KEEP="${PB_BACKUPS_MAX_KEEP:-7}"
 
-# Explicit restore only
-PB_BACKUP_BUCKET_URL="${PB_BACKUP_BUCKET_URL:-}"
-PB_RESTORE_OBJECT="${PB_RESTORE_OBJECT:-}"   # filename under PB_BACKUP_BUCKET_URL or full s3:// URL
+# Explicit restore selector (filename under backups bucket, or full s3:// URL)
+PB_RESTORE_OBJECT="${PB_RESTORE_OBJECT:-}"
 
-# AWS (Wasabi)
-AWS_REGION="${AWS_REGION:-us-east-1}"
-AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
-AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
-export AWS_REGION AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
-AWS_S3_ENDPOINT="${AWS_S3_ENDPOINT:-}"
-if [ -z "$AWS_S3_ENDPOINT" ]; then
-  if [ -n "${PB_S3_BACKUPS_ENDPOINT:-}" ]; then AWS_S3_ENDPOINT="$PB_S3_BACKUPS_ENDPOINT"; else AWS_S3_ENDPOINT="$PB_S3_STORAGE_ENDPOINT"; fi
-fi
-
+# Compute a consistent escaped admin email once
 ESC_EMAIL="$(printf "%s" "$PB_ADMIN_EMAIL" | sed "s/'/''/g")"
 
 ############################################
@@ -67,6 +57,25 @@ mkdir -p /pb_data /pb_migrations
 sql() { sqlite3 /pb_data/data.db "$1"; }
 wal_ckpt() { sqlite3 /pb_data/data.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true; }
 vacuum_db() { sqlite3 /pb_data/data.db "VACUUM;" >/dev/null 2>&1 || true; }
+
+############################################
+# Backups S3 helpers (per-op AWS creds)
+############################################
+# Prefer explicit "backups" values; fall back to "storage" if not provided.
+BK_BUCKET="${PB_S3_BACKUPS_BUCKET:-$PB_S3_STORAGE_BUCKET}"
+BK_REGION="${PB_S3_BACKUPS_REGION:-$PB_S3_STORAGE_REGION}"
+BK_ENDPOINT="${PB_S3_BACKUPS_ENDPOINT:-$PB_S3_STORAGE_ENDPOINT}"
+BK_AK="${PB_S3_BACKUPS_ACCESS_KEY:-$PB_S3_STORAGE_ACCESS_KEY}"
+BK_SK="${PB_S3_BACKUPS_SECRET:-$PB_S3_STORAGE_SECRET}"
+
+aws_bk() {
+  AWS_ACCESS_KEY_ID="$BK_AK" AWS_SECRET_ACCESS_KEY="$BK_SK" AWS_REGION="$BK_REGION" \
+    aws --endpoint-url "$BK_ENDPOINT" "$@"
+}
+
+_s3_object_exists() {
+  aws_bk s3 ls "$1" >/dev/null 2>&1
+}
 
 ############################################
 # Restore helpers
@@ -92,16 +101,10 @@ _restore_from_zip_any_layout() {
   src_dir="$(dirname "$data_path")"
   echo "[restore] Found data root: $src_dir"
 
-  # Copy the entire DB dir (data.db, wal/shm if present, logs.db, etc.) and delete anything extra on target
   rsync -a --delete "$src_dir"/ /pb_data/
 
   rm -rf "$zip_path" "$tmpdir"
   return 0
-}
-
-_s3_object_exists() {
-  local url="$1"
-  aws --endpoint-url "$AWS_S3_ENDPOINT" s3 ls "$url" >/dev/null 2>&1
 }
 
 ############################################
@@ -109,22 +112,22 @@ _s3_object_exists() {
 ############################################
 echo "[env] PB_RESTORE_OBJECT=${PB_RESTORE_OBJECT:-<unset>}"
 if [ -n "$PB_RESTORE_OBJECT" ]; then
-  # Resolve full URL
+  # Build full URL if needed (we no longer use PB_BACKUP_BUCKET_URL)
   if printf "%s" "$PB_RESTORE_OBJECT" | grep -q '^s3://'; then
     RESTORE_URL="$PB_RESTORE_OBJECT"
   else
-    [ -z "$PB_BACKUP_BUCKET_URL" ] && { echo "[restore] ERROR: PB_BACKUP_BUCKET_URL empty"; exit 1; }
-    RESTORE_URL="${PB_BACKUP_BUCKET_URL%/}/$PB_RESTORE_OBJECT"
+    [ -n "$BK_BUCKET" ] || { echo "[restore] ERROR: Backups bucket not set (PB_S3_BACKUPS_BUCKET or PB_S3_STORAGE_BUCKET)"; exit 1; }
+    RESTORE_URL="s3://${BK_BUCKET%/}/$PB_RESTORE_OBJECT"
   fi
   echo "[restore] Resolved: $RESTORE_URL"
 
-  # Verify object exists
+  # Verify object exists with backups creds
   if ! _s3_object_exists "$RESTORE_URL"; then
     echo "[restore] ERROR: Object not found: $RESTORE_URL"
     exit 1
   fi
 
-  # Snapshot current data, then *empty* /pb_data
+  # Snapshot current data, then empty /pb_data
   if [ -d /pb_data ] && [ "$(ls -A /pb_data 2>/dev/null | wc -l)" -gt 0 ]; then
     TS="$(date +%Y%m%d-%H%M%S)"
     BACKUP_DIR="/pb_data._pre_restore_$TS"
@@ -134,9 +137,8 @@ if [ -n "$PB_RESTORE_OBJECT" ]; then
   fi
   mkdir -p /pb_data
 
-  # Download and apply
   echo "[restore] Downloading archive…"
-  aws --endpoint-url "$AWS_S3_ENDPOINT" s3 cp "$RESTORE_URL" /tmp/pb_backup.zip
+  aws_bk s3 cp "$RESTORE_URL" /tmp/pb_backup.zip
 
   echo "[restore] Applying archive (rsync --delete)…"
   if ! _restore_from_zip_any_layout /tmp/pb_backup.zip; then
@@ -149,7 +151,6 @@ if [ -n "$PB_RESTORE_OBJECT" ]; then
     exit 1
   fi
 
-  # Normalize SQLite state to avoid WAL surprises
   echo "[restore] Forcing WAL checkpoint + VACUUM…"
   wal_ckpt
   vacuum_db
@@ -352,4 +353,3 @@ echo "[bootstrap] Done."
 exec /app/pocketbase $ENCRYPTION_ARG \
   --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
   serve --http 0.0.0.0:8090
- 
