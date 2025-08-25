@@ -1,9 +1,8 @@
 #!/usr/bin/env sh
 set -euo pipefail
-
 [ "${PB_DEBUG:-false}" = "true" ] && set -x
 
-echo "[boot] entrypoint v7.30 (stateless, no-restore) loaded"
+echo "[boot] entrypoint v7.31 (stateless, no-restore, migrate-up) loaded"
 
 ############################################
 # Required env
@@ -30,7 +29,7 @@ PB_S3_STORAGE_ACCESS_KEY="${PB_S3_STORAGE_ACCESS_KEY:-}"
 PB_S3_STORAGE_SECRET="${PB_S3_STORAGE_SECRET:-}"
 PB_S3_STORAGE_FORCE_PATH_STYLE="${PB_S3_STORAGE_FORCE_PATH_STYLE:-false}"
 
-# S3 backups (PocketBase cron)
+# S3 backups (PocketBase cron config only — no restore here)
 PB_S3_BACKUPS_ENABLED="${PB_S3_BACKUPS_ENABLED:-true}"
 PB_S3_BACKUPS_BUCKET="${PB_S3_BACKUPS_BUCKET:-}"
 PB_S3_BACKUPS_REGION="${PB_S3_BACKUPS_REGION:-}"
@@ -54,7 +53,7 @@ sql() { sqlite3 /pb_data/data.db "$1"; }
 wal_ckpt() { sqlite3 /pb_data/data.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true; }
 
 ############################################
-# Init core + migrations (one-time kick)
+# Initialize PB once (creates DB if missing), then run migrations
 ############################################
 INIT_PORT=8097
 echo "[init] Starting PB once on :${INIT_PORT}…"
@@ -66,8 +65,19 @@ for i in $(seq 1 120); do
   if curl -fsS "http://127.0.0.1:${INIT_PORT}/api/health" >/dev/null 2>&1; then sleep 0.5; break; fi
   [ "$i" -eq 120 ] && echo "[init] PB failed to start" && cat /tmp/pb_init.log && exit 1
 done
+# Stop the bootstrap server
 kill $INIT_PID; wait $INIT_PID 2>/dev/null || true
-echo "[init] Core/migrations initialized."
+echo "[init] Core up once."
+
+echo "[migrate] Applying migrations (pocketbase migrate up)…"
+/app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations migrate up >/tmp/pb_migrate.log 2>&1 || true
+# If migrate failed with a lock or similar transient, try once more:
+if ! grep -qi "applied" /tmp/pb_migrate.log 2>/dev/null && ! grep -qi "no new" /tmp/pb_migrate.log 2>/dev/null; then
+  echo "[migrate] Retry migrate up after short delay…"
+  sleep 1
+  /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations migrate up >/tmp/pb_migrate_retry.log 2>&1 || true
+fi
+echo "[migrate] done."
 
 ############################################
 # Temp PB helpers + admin login/repair
@@ -215,7 +225,7 @@ else
   echo "[settings] No settings changes."
 fi
 
-# Cleanup temps, stop temp PB, and start real server
+# Cleanup and launch the real server
 rm -f "$META_FILE" "$STOR_FILE" "$BACK_FILE" "$DESIRED_FILE" "$DESIRED_TRIM_FILE" \
       "$LIVE_FILE" "$LIVE_TRIM_FILE" /tmp/pb_patch_code.txt 2>/dev/null || true
 
