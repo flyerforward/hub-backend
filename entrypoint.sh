@@ -1,14 +1,20 @@
 #!/usr/bin/env sh
 set -euo pipefail
 
-echo "[boot] entrypoint v7.13 loaded"
+echo "[boot] entrypoint v7.14 loaded"
 
 ############################################
 # Env
 ############################################
 : "${PB_ADMIN_EMAIL:?Set PB_ADMIN_EMAIL}"
 : "${PB_ADMIN_PASSWORD:?Set PB_ADMIN_PASSWORD}"
-PB_ADMIN_ENFORCE_SINGLE="${PB_ADMIN_ENFORCE_SINGLE:-true}"
+
+# If auth fails, should we remove ALL admins, or only the conflicting ones?
+# - all   = delete every admin and then create env admin (strongest)
+# - single= delete only the admin with PB_ADMIN_EMAIL (if present), else delete-all
+PB_ADMIN_RESET_MODE="${PB_ADMIN_RESET_MODE:-all}"
+
+PB_ADMIN_ENFORCE_SINGLE="${PB_ADMIN_ENFORCE_SINGLE:-true}"  # if multiple admins exist, keep only env admin
 
 PB_ENCRYPTION="${PB_ENCRYPTION:-}"
 ENCRYPTION_ARG=""
@@ -26,7 +32,7 @@ PB_S3_STORAGE_ACCESS_KEY="${PB_S3_STORAGE_ACCESS_KEY:-}"
 PB_S3_STORAGE_SECRET="${PB_S3_STORAGE_SECRET:-}"
 PB_S3_STORAGE_FORCE_PATH_STYLE="${PB_S3_STORAGE_FORCE_PATH_STYLE:-false}"
 
-# S3 backups (PocketBase cron)
+# S3 backups
 PB_S3_BACKUPS_ENABLED="${PB_S3_BACKUPS_ENABLED:-true}"
 PB_S3_BACKUPS_BUCKET="${PB_S3_BACKUPS_BUCKET:-}"
 PB_S3_BACKUPS_REGION="${PB_S3_BACKUPS_REGION:-}"
@@ -64,7 +70,6 @@ mkdir -p /pb_data /pb_migrations /pb_state
 [ -d /app/pb_migrations ] && rsync -a --update /app/pb_migrations/ /pb_migrations/
 
 SETTINGS_SHA_FILE="/pb_state/.settings_sha256"
-PW_SHA_FILE="/pb_state/.admin_pw_sha256"
 
 ############################################
 # Restore (root-files layout only)
@@ -93,7 +98,7 @@ if [ ! -f /pb_data/data.db ] && [ "$PB_RESTORE_FROM_S3" = "true" ] && [ -n "$PB_
 fi
 
 ############################################
-# Init core + migrations (one-time)
+# Init core + migrations
 ############################################
 INIT_PORT=8097
 echo "[init] Starting PB once on :${INIT_PORT}…"
@@ -109,40 +114,98 @@ kill $INIT_PID; wait $INIT_PID 2>/dev/null || true
 echo "[init] Core/migrations initialized."
 
 ############################################
-# Admin enforcement
+# (A) Simple login test (no logout if success)
 ############################################
-ADMINS_TOTAL=$(sqlite3 /pb_data/data.db "SELECT COUNT(*) FROM _admins;" 2>/dev/null || echo 0)
-ESC_EMAIL="$(printf "%s" "$PB_ADMIN_EMAIL" | sed "s/'/''/g")"
-EMAIL_COUNT=$(sqlite3 /pb_data/data.db "SELECT COUNT(*) FROM _admins WHERE email = '$ESC_EMAIL';" 2>/dev/null || echo 0)
+BOOT_PORT=8099
+start_temp() {
+  /app/pocketbase $ENCRYPTION_ARG --dev --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
+    serve --http 127.0.0.1:${BOOT_PORT} >/tmp/pb_bootstrap.log 2>&1 &
+  PB_PID=$!
+  for i in $(seq 1 120); do
+    sleep 0.25
+    if curl -fsS "http://127.0.0.1:${BOOT_PORT}/api/health" >/dev/null 2>&1; then return 0; fi
+  done
+  echo "[bootstrap] PB failed to start"; tail -n 200 /tmp/pb_bootstrap.log || true; return 1
+}
+stop_temp() { kill $PB_PID 2>/dev/null || true; wait $PB_PID 2>/dev/null || true; }
 
-if [ "${ADMINS_TOTAL:-0}" -eq 0 ]; then
-  echo "[admin] No admins found; creating $PB_ADMIN_EMAIL"
+AUTH_BODY="$(jq -n --arg id "$PB_ADMIN_EMAIL" --arg pw "$PB_ADMIN_PASSWORD" '{identity:$id, password:$pw}')"
+try_auth() {
+  curl -sS -X POST "http://127.0.0.1:${BOOT_PORT}/api/admins/auth-with-password" \
+    -H "Content-Type: application/json" --data-binary "$AUTH_BODY" || true
+}
+
+echo "[auth] Starting temp PB for login test…"
+start_temp
+AUTH_JSON="$(try_auth)"
+ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
+
+if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
+  echo "[auth] Env admin password did not authenticate → resetting admin(s) as requested."
+  stop_temp
+
+  # Offline admin repair (no server running)
+  if [ "$PB_ADMIN_RESET_MODE" = "all" ]; then
+    for em in $(sqlite3 -newline $'\n' /pb_data/data.db "SELECT email FROM _admins;"); do
+      echo "[admin] Deleting: $em"
+      /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
+        admin delete "$em" >/tmp/pb_admin_delete.log 2>&1 || true
+    done
+  else
+    # single: try to delete only the conflicting email; if none left, delete-all fallback
+    EXISTING="$(sqlite3 /pb_data/data.db "SELECT COUNT(*) FROM _admins WHERE email='$(printf "%s" "$PB_ADMIN_EMAIL" | sed "s/'/''/g")';" 2>/dev/null || echo 0)"
+    if [ "$EXISTING" -gt 0 ]; then
+      echo "[admin] Deleting only $PB_ADMIN_EMAIL"
+      /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
+        admin delete "$PB_ADMIN_EMAIL" >/tmp/pb_admin_delete.log 2>&1 || true
+    else
+      echo "[admin] No admin with env email; deleting all admins."
+      for em in $(sqlite3 -newline $'\n' /pb_data/data.db "SELECT email FROM _admins;"); do
+        echo "[admin] Deleting: $em"
+        /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
+          admin delete "$em" >/tmp/pb_admin_delete.log 2>&1 || true
+      done
+    fi
+  fi
+
+  echo "[admin] Creating env admin ${PB_ADMIN_EMAIL}"
   /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
     admin create "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_create.log 2>&1 || true
   echo "[admin] create output:"; cat /tmp/pb_admin_create.log || true
-elif [ "${EMAIL_COUNT:-0}" -gt 0 ]; then
-  echo "[admin] Env admin already exists."
+
+  echo "[auth] Re-starting temp PB and authenticating again…"
+  start_temp
+  AUTH_JSON="$(try_auth)"
+  ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
+  if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
+    echo "[auth] Auth still failing; aborting."; tail -n 200 /tmp/pb_bootstrap.log || true; stop_temp; exit 1
+  fi
 else
-  if [ "$PB_ADMIN_ENFORCE_SINGLE" = "true" ]; then
+  echo "[auth] Login test succeeded (no logout caused by this)."
+fi
+
+############################################
+# (B) Enforce single-admin policy (optional)
+############################################
+if [ "$PB_ADMIN_ENFORCE_SINGLE" = "true" ]; then
+  COUNT=$(sqlite3 /pb_data/data.db "SELECT COUNT(*) FROM _admins;" 2>/dev/null || echo 0)
+  if [ "$COUNT" -gt 1 ]; then
     echo "[admin] Enforcing single admin: deleting non-env admins."
-    for em in $(sqlite3 -newline $'\n' /pb_data/data.db "SELECT email FROM _admins;"); do
-      if [ "$em" != "$PB_ADMIN_EMAIL" ]; then
-        echo "[admin] Deleting admin: $em"
-        /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-          admin delete "$em" >/tmp/pb_admin_delete.log 2>&1 || true
-      fi
+    stop_temp
+    for em in $(sqlite3 -newline $'\n' /pb_data/data.db "SELECT email FROM _admins WHERE email != '$(printf "%s" "$PB_ADMIN_EMAIL" | sed "s/'/''/g")';"); do
+      echo "[admin] Deleting: $em"
+      /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
+        admin delete "$em" >/tmp/pb_admin_delete.log 2>&1 || true
     done
-    echo "[admin] Ensuring env admin exists."
-    /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-      admin create "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_create.log 2>&1 || true
-    echo "[admin] create output:"; cat /tmp/pb_admin_create.log || true
-  else
-    echo "[admin] PB_ADMIN_ENFORCE_SINGLE=false → leaving existing admins."
+    start_temp
+    # refresh token (not strictly needed)
+    AUTH_JSON="$(try_auth)"
+    ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
   fi
 fi
 
 ############################################
-# Build desired settings JSON + Stable hashes in /pb_state
+# (C) Desired settings hash → PATCH only if changed
 ############################################
 META_FILE="$(mktemp)"; STOR_FILE="$(mktemp)"; BACK_FILE="$(mktemp)"
 jq -n --arg url "$PB_PUBLIC_URL" '{meta:{appName:"PocketBase",appUrl:$url}}' > "$META_FILE"
@@ -177,78 +240,13 @@ fi
 
 DESIRED_FILE="$(mktemp)"
 jq -s 'add' "$META_FILE" "$STOR_FILE" "$BACK_FILE" > "$DESIRED_FILE"
-
-# Hash only the fields we manage
 DESIRED_TRIM_FILE="$(mktemp)"
 jq '{meta:{appUrl:.meta.appUrl}, s3, backups}' "$DESIRED_FILE" | jq -S . > "$DESIRED_TRIM_FILE"
-DESIRED_SETTINGS_SHA="$(sha256sum "$DESIRED_TRIM_FILE" | awk '{print $1}')"
-PREV_SETTINGS_SHA="$(cat "$SETTINGS_SHA_FILE" 2>/dev/null || echo "")"
+DESIRED_SHA="$(sha256sum "$DESIRED_TRIM_FILE" | awk '{print $1}')"
+PREV_SHA="$(cat "$SETTINGS_SHA_FILE" 2>/dev/null || echo "")"
 
-# Password hash marker (based on env var; never stored in PB)
-DESIRED_PW_SHA="$(printf '%s' "$PB_ADMIN_PASSWORD" | sha256sum | awk '{print $1}')"
-PREV_PW_SHA="$(cat "$PW_SHA_FILE" 2>/dev/null || echo "")"
-
-SETTINGS_CHANGED="no"
-PW_CHANGED="no"
-[ "$DESIRED_SETTINGS_SHA" != "$PREV_SETTINGS_SHA" ] && SETTINGS_CHANGED="yes"
-[ "$DESIRED_PW_SHA" != "$PREV_PW_SHA" ] && PW_CHANGED="yes"
-
-echo "[settings] changed=$SETTINGS_CHANGED"
-echo "[admin-pw] changed=$PW_CHANGED"
-
-############################################
-# If neither changed → start PB (no login = no logout)
-############################################
-if [ "$SETTINGS_CHANGED" = "no" ] && [ "$PW_CHANGED" = "no" ]; then
-  rm -f "$META_FILE" "$STOR_FILE" "$BACK_FILE" "$DESIRED_FILE" "$DESIRED_TRIM_FILE" 2>/dev/null || true
-  exec /app/pocketbase $ENCRYPTION_ARG \
-    --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
-    serve --http 0.0.0.0:8090
-fi
-
-############################################
-# Temp server, auth, conditional password update, PATCH if needed
-############################################
-BOOT_PORT=8099
-echo "[bootstrap] Starting temporary PB on :${BOOT_PORT}…"
-/app/pocketbase $ENCRYPTION_ARG --dev --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
-  serve --http 127.0.0.1:${BOOT_PORT} >/tmp/pb_bootstrap.log 2>&1 &
-PB_PID=$!
-for i in $(seq 1 120); do
-  sleep 0.25
-  if curl -fsS "http://127.0.0.1:${BOOT_PORT}/api/health" >/dev/null 2>&1; then break; fi
-  [ "$i" -eq 120 ] && echo "[bootstrap] PB failed to start" && tail -n 200 /tmp/pb_bootstrap.log && exit 1
-done
-
-AUTH_BODY="$(jq -n --arg id "$PB_ADMIN_EMAIL" --arg pw "$PB_ADMIN_PASSWORD" '{identity:$id, password:$pw}')"
-try_auth() {
-  curl -sS -X POST "http://127.0.0.1:${BOOT_PORT}/api/admins/auth-with-password" \
-    -H "Content-Type: application/json" --data-binary "$AUTH_BODY" || true
-}
-AUTH_JSON="$(try_auth)"
-ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
-
-if [ "$PW_CHANGED" = "yes" ]; then
-  if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
-    echo "[admin] Env password changed → updating admin password"
-    /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-      admin update "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_update.log 2>&1 || true
-    echo "[admin] update output:"; cat /tmp/pb_admin_update.log || true
-    AUTH_JSON="$(try_auth)"
-    ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
-  else
-    echo "[admin] Env password changed but already matches DB (rare); continuing."
-  fi
-fi
-
-if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
-  echo "[bootstrap] Failed to obtain admin token."; tail -n 200 /tmp/pb_bootstrap.log || true
-  kill $PB_PID; wait $PB_PID 2>/dev/null || true
-  exit 1
-fi
-
-# PATCH settings only if needed
-if [ "$SETTINGS_CHANGED" = "yes" ]; then
+if [ "$DESIRED_SHA" != "$PREV_SHA" ]; then
+  echo "[settings] Applying settings changes…"
   PATCH_OUT="$(mktemp)"; PATCH_CODE=0
   cat "$DESIRED_FILE" | curl -sS -w "%{http_code}" -o "$PATCH_OUT" \
     -X PATCH "http://127.0.0.1:${BOOT_PORT}/api/settings" \
@@ -256,22 +254,18 @@ if [ "$SETTINGS_CHANGED" = "yes" ]; then
     --data-binary @- > /tmp/pb_patch_code.txt || PATCH_CODE=$?
   HTTP_CODE="$(cat /tmp/pb_patch_code.txt || echo 000)"
   if [ "$PATCH_CODE" -ne 0 ] || [ "$HTTP_CODE" -ge 400 ]; then
-    echo "[bootstrap] Settings PATCH failed (HTTP $HTTP_CODE). Response:"; cat "$PATCH_OUT"
+    echo "[settings] PATCH failed (HTTP $HTTP_CODE). Response:"; cat "$PATCH_OUT"
     echo "--- bootstrap.log (tail) ---"; tail -n 200 /tmp/pb_bootstrap.log || true
-    kill $PB_PID; wait $PB_PID 2>/dev/null || true
-    exit 1
+    stop_temp; exit 1
   fi
-  echo "$DESIRED_SETTINGS_SHA" > "$SETTINGS_SHA_FILE"
+  echo "$DESIRED_SHA" > "$SETTINGS_SHA_FILE"
+else
+  echo "[settings] No settings changes."
 fi
 
-# Persist the new password hash if it changed
-if [ "$PW_CHANGED" = "yes" ]; then
-  echo "$DESIRED_PW_SHA" > "$PW_SHA_FILE"
-fi
-
-# Cleanup & start real server
-rm -f "$META_FILE" "$STOR_FILE" "$BACK_FILE" "$DESIRED_FILE" "$DESIRED_TRIM_FILE" 2>/dev/null || true
-kill $PB_PID; wait $PB_PID 2>/dev/null || true
+# Cleanup temp resources, start real server
+rm -f "$META_FILE" "$STOR_FILE" "$BACK_FILE" "$DESIRED_FILE" "$DESIRED_TRIM_FILE" /tmp/pb_patch_code.txt 2>/dev/null || true
+stop_temp
 echo "[bootstrap] Done."
 
 exec /app/pocketbase $ENCRYPTION_ARG \
