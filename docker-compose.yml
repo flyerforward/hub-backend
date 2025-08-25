@@ -4,8 +4,8 @@ services:
       context: .
       dockerfile: Dockerfile
       cache_from: []                     # <-- disables build cache
-      #args:
-        #BUILD_TIMESTAMP: ${BUILD_TIMESTAMP:-}   # changes every deploy automatically
+      args:
+        BUILD_TIMESTAMP: ${BUILD_TIMESTAMP:-}   # changes every deploy automatically
     container_name: pocketbase
     command: ["/app/entrypoint.sh"]
     restart: always
