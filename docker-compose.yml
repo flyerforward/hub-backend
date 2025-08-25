@@ -1,5 +1,5 @@
 services:
-  pocketbase:
+  pocketbased:
     build:
       context: .
       dockerfile: Dockerfile
