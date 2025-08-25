@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -euo pipefail
 
-echo "[boot] entrypoint v7.12 loaded"
+echo "[boot] entrypoint v7.13 loaded"
 
 ############################################
 # Env
@@ -60,8 +60,11 @@ fi
 # Tools & dirs
 ############################################
 apk add --no-cache aws-cli unzip curl jq rsync sqlite coreutils >/dev/null 2>&1 || true
-mkdir -p /pb_data /pb_migrations
+mkdir -p /pb_data /pb_migrations /pb_state
 [ -d /app/pb_migrations ] && rsync -a --update /app/pb_migrations/ /pb_migrations/
+
+SETTINGS_SHA_FILE="/pb_state/.settings_sha256"
+PW_SHA_FILE="/pb_state/.admin_pw_sha256"
 
 ############################################
 # Restore (root-files layout only)
@@ -139,7 +142,7 @@ else
 fi
 
 ############################################
-# Build desired settings JSON + hash
+# Build desired settings JSON + Stable hashes in /pb_state
 ############################################
 META_FILE="$(mktemp)"; STOR_FILE="$(mktemp)"; BACK_FILE="$(mktemp)"
 jq -n --arg url "$PB_PUBLIC_URL" '{meta:{appName:"PocketBase",appUrl:$url}}' > "$META_FILE"
@@ -178,23 +181,19 @@ jq -s 'add' "$META_FILE" "$STOR_FILE" "$BACK_FILE" > "$DESIRED_FILE"
 # Hash only the fields we manage
 DESIRED_TRIM_FILE="$(mktemp)"
 jq '{meta:{appUrl:.meta.appUrl}, s3, backups}' "$DESIRED_FILE" | jq -S . > "$DESIRED_TRIM_FILE"
-DESIRED_SHA="$(sha256sum "$DESIRED_TRIM_FILE" | awk '{print $1}')"
-APPLIED_SHA_FILE="/pb_data/.settings_sha256"
-PREV_SETTINGS_SHA="$(cat "$APPLIED_SHA_FILE" 2>/dev/null || echo "")"
+DESIRED_SETTINGS_SHA="$(sha256sum "$DESIRED_TRIM_FILE" | awk '{print $1}')"
+PREV_SETTINGS_SHA="$(cat "$SETTINGS_SHA_FILE" 2>/dev/null || echo "")"
 
-############################################
-# Password change detection (hash of env password)
-############################################
-PW_SHA_FILE="/pb_data/.admin_pw_sha256"
+# Password hash marker (based on env var; never stored in PB)
 DESIRED_PW_SHA="$(printf '%s' "$PB_ADMIN_PASSWORD" | sha256sum | awk '{print $1}')"
 PREV_PW_SHA="$(cat "$PW_SHA_FILE" 2>/dev/null || echo "")"
 
 SETTINGS_CHANGED="no"
 PW_CHANGED="no"
-[ "$DESIRED_SHA" != "$PREV_SETTINGS_SHA" ] && SETTINGS_CHANGED="yes"
+[ "$DESIRED_SETTINGS_SHA" != "$PREV_SETTINGS_SHA" ] && SETTINGS_CHANGED="yes"
 [ "$DESIRED_PW_SHA" != "$PREV_PW_SHA" ] && PW_CHANGED="yes"
 
-echo "[settings] changed=$SETTINGS_CHANGED (hash prev=$PREV_SETTINGS_SHA new=$DESIRED_SHA)"
+echo "[settings] changed=$SETTINGS_CHANGED"
 echo "[admin-pw] changed=$PW_CHANGED"
 
 ############################################
@@ -230,13 +229,11 @@ AUTH_JSON="$(try_auth)"
 ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
 
 if [ "$PW_CHANGED" = "yes" ]; then
-  # If env password changed, ensure DB uses it:
   if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
     echo "[admin] Env password changed → updating admin password"
     /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
       admin update "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_update.log 2>&1 || true
     echo "[admin] update output:"; cat /tmp/pb_admin_update.log || true
-
     AUTH_JSON="$(try_auth)"
     ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
   else
@@ -244,7 +241,6 @@ if [ "$PW_CHANGED" = "yes" ]; then
   fi
 fi
 
-# If still no token by here, try once more to be safe
 if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
   echo "[bootstrap] Failed to obtain admin token."; tail -n 200 /tmp/pb_bootstrap.log || true
   kill $PB_PID; wait $PB_PID 2>/dev/null || true
@@ -265,8 +261,7 @@ if [ "$SETTINGS_CHANGED" = "yes" ]; then
     kill $PB_PID; wait $PB_PID 2>/dev/null || true
     exit 1
   fi
-  rm -f "$PATCH_OUT" /tmp/pb_patch_code.txt
-  echo "$DESIRED_SHA" > "$APPLIED_SHA_FILE"
+  echo "$DESIRED_SETTINGS_SHA" > "$SETTINGS_SHA_FILE"
 fi
 
 # Persist the new password hash if it changed
