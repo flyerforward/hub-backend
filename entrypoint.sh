@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -euo pipefail
 
-echo "[boot] entrypoint v7.16 (stateless) loaded"
+echo "[boot] entrypoint v7.18 (stateless + explicit restore only) loaded"
 
 ############################################
 # Env
@@ -9,12 +9,7 @@ echo "[boot] entrypoint v7.16 (stateless) loaded"
 : "${PB_ADMIN_EMAIL:?Set PB_ADMIN_EMAIL}"
 : "${PB_ADMIN_PASSWORD:?Set PB_ADMIN_PASSWORD}"
 
-# Reset behavior if login fails:
-#   all    → delete all admins, then create env admin (last resort path only)
-#   single → delete only env email (if present), else delete-all
 PB_ADMIN_RESET_MODE="${PB_ADMIN_RESET_MODE:-single}"
-
-# After successful auth, optionally ensure only env admin remains
 PB_ADMIN_ENFORCE_SINGLE="${PB_ADMIN_ENFORCE_SINGLE:-true}"
 
 PB_ENCRYPTION="${PB_ENCRYPTION:-}"
@@ -44,9 +39,9 @@ PB_S3_BACKUPS_FORCE_PATH_STYLE="${PB_S3_BACKUPS_FORCE_PATH_STYLE:-false}"
 PB_BACKUPS_CRON="${PB_BACKUPS_CRON:-0 3 * * *}"
 PB_BACKUPS_MAX_KEEP="${PB_BACKUPS_MAX_KEEP:-7}"
 
-# First-boot restore
-PB_RESTORE_FROM_S3="${PB_RESTORE_FROM_S3:-true}"
+# Explicit restore only
 PB_BACKUP_BUCKET_URL="${PB_BACKUP_BUCKET_URL:-}"
+PB_RESTORE_OBJECT="${PB_RESTORE_OBJECT:-}"   # Filename or full s3:// URL
 
 # AWS (Wasabi)
 AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -58,7 +53,6 @@ if [ -z "$AWS_S3_ENDPOINT" ]; then
   if [ -n "${PB_S3_BACKUPS_ENDPOINT:-}" ]; then AWS_S3_ENDPOINT="$PB_S3_BACKUPS_ENDPOINT"; else AWS_S3_ENDPOINT="$PB_S3_STORAGE_ENDPOINT"; fi
 fi
 
-# Always-available escaped admin email
 ESC_EMAIL="$(printf "%s" "$PB_ADMIN_EMAIL" | sed "s/'/''/g")"
 
 ############################################
@@ -72,27 +66,48 @@ sql() { sqlite3 /pb_data/data.db "$1"; }
 wal_ckpt() { sqlite3 /pb_data/data.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true; }
 
 ############################################
-# Restore (root-files layout only)
+# Restore helpers
 ############################################
-if [ ! -f /pb_data/data.db ] && [ "$PB_RESTORE_FROM_S3" = "true" ] && [ -n "$PB_BACKUP_BUCKET_URL" ]; then
-  echo "[restore] No data.db; attempting restore from $PB_BACKUP_BUCKET_URL"
-  LATEST_KEY="$(
-    aws --endpoint-url "$AWS_S3_ENDPOINT" s3 ls "${PB_BACKUP_BUCKET_URL%/}/" | awk '{print $4,$1,$2}' | sort -k2,3 | tail -n1 | awk '{print $1}'
-  )"
-  if [ -n "$LATEST_KEY" ]; then
-    echo "[restore] Found backup: $LATEST_KEY"
-    aws --endpoint-url "$AWS_S3_ENDPOINT" s3 cp "${PB_BACKUP_BUCKET_URL%/}/${LATEST_KEY}" /tmp/pb_backup.zip
-    unzip -o /tmp/pb_backup.zip -d /tmp/pb_restore
-    if [ -f /tmp/pb_restore/data.db ]; then
-      echo "[restore] Using 'root files' layout from archive."
-      cp -a /tmp/pb_restore/. /pb_data/
-      echo "[restore] Restore completed."
-    else
-      echo "[restore] Required files not found at archive root; skipping restore."
-    fi
-    rm -rf /tmp/pb_backup.zip /tmp/pb_restore
+_restore_from_zip() {
+  local zip_path="$1"
+  unzip -o "$zip_path" -d /tmp/pb_restore
+  if [ -f /tmp/pb_restore/data.db ]; then
+    echo "[restore] Using 'root files' layout from archive."
+    cp -a /tmp/pb_restore/. /pb_data/
+    echo "[restore] Restore completed."
   else
-    echo "[restore] No backups found; starting fresh."
+    echo "[restore] Required files not found at archive root; skipping restore."
+  fi
+  rm -rf "$zip_path" /tmp/pb_restore
+}
+
+_s3_object_exists() {
+  local url="$1"
+  aws --endpoint-url "$AWS_S3_ENDPOINT" s3 ls "$url" >/dev/null 2>&1
+}
+
+############################################
+# Restore (explicit only)
+############################################
+if [ ! -f /pb_data/data.db ] && [ -n "$PB_RESTORE_OBJECT" ]; then
+  if printf "%s" "$PB_RESTORE_OBJECT" | grep -q '^s3://'; then
+    RESTORE_URL="$PB_RESTORE_OBJECT"
+  else
+    if [ -z "$PB_BACKUP_BUCKET_URL" ]; then
+      echo "[restore] PB_RESTORE_OBJECT provided but PB_BACKUP_BUCKET_URL is empty; cannot resolve key."
+      RESTORE_URL=""
+    else
+      RESTORE_URL="${PB_BACKUP_BUCKET_URL%/}/$PB_RESTORE_OBJECT"
+    fi
+  fi
+
+  if [ -n "${RESTORE_URL:-}" ] && _s3_object_exists "$RESTORE_URL"; then
+    echo "[restore] Restoring explicit object: $RESTORE_URL"
+    aws --endpoint-url "$AWS_S3_ENDPOINT" s3 cp "$RESTORE_URL" /tmp/pb_backup.zip
+    _restore_from_zip /tmp/pb_backup.zip
+  else
+    echo "[restore] Specified PB_RESTORE_OBJECT not found: ${RESTORE_URL:-<unset>}"
+    echo "[restore] Starting fresh."
   fi
 fi
 
@@ -142,7 +157,6 @@ if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
   echo "[auth] Login failed → repairing admin in-place if possible."
   stop_temp
 
-  # 1) Does env admin exist?
   EXISTS="$(sql "SELECT COUNT(*) FROM _admins WHERE email='$ESC_EMAIL';" 2>/dev/null || echo 0)"
 
   if [ "${EXISTS:-0}" -gt 0 ]; then
@@ -151,29 +165,25 @@ if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
       admin update "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_update.log 2>&1 || true
     echo "[admin] update output:"; cat /tmp/pb_admin_update.log || true
 
-    # Re-test auth
     start_temp
     AUTH_JSON="$(try_auth)"
     ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
     if [ -n "$ADMIN_TOKEN" ] && [ "$ADMIN_TOKEN" != "null" ]; then
       echo "[auth] Auth succeeded after update."
     else
-      echo "[admin] Update didn’t fix it → deleting the admin row and recreating."
+      echo "[admin] Update didn’t fix it → deleting and recreating admin."
       stop_temp
       /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
         admin delete "$PB_ADMIN_EMAIL" >/tmp/pb_admin_delete.log 2>&1 || true
-      # Verify deletion; if row still there, hard-delete via SQLite
       COUNT_AFTER_CLI="$(sql "SELECT COUNT(*) FROM _admins WHERE email='$ESC_EMAIL';" 2>/dev/null || echo 0)"
       if [ "$COUNT_AFTER_CLI" -gt 0 ]; then
-        echo "[admin] CLI delete didn’t remove row → deleting with SQLite."
         sql "DELETE FROM _admins WHERE email='$ESC_EMAIL';"
       fi
       wal_ckpt
-
       echo "[admin] Creating env admin ${PB_ADMIN_EMAIL}"
       /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
         admin create "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_create.log 2>&1 || true
-      echo "[admin] create output:"; cat /tmp/pb_admin_create.log || true
+      cat /tmp/pb_admin_create.log || true
 
       start_temp
       AUTH_JSON="$(try_auth)"
@@ -186,19 +196,9 @@ if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
 
   else
     echo "[admin] Env admin does not exist → creating."
-    # Optionally clean other admins depending on reset mode
-    if [ "$PB_ADMIN_RESET_MODE" = "all" ]; then
-      for em in $(sql "SELECT email FROM _admins;"); do
-        echo "[admin] Deleting: $em"
-        /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-          admin delete "$em" >/tmp/pb_admin_delete.log 2>&1 || true
-      done
-      wal_ckpt
-    fi
-
     /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
       admin create "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_create.log 2>&1 || true
-    echo "[admin] create output:"; cat /tmp/pb_admin_create.log || true
+    cat /tmp/pb_admin_create.log || true
 
     start_temp
     AUTH_JSON="$(try_auth)"
@@ -227,7 +227,6 @@ if [ "$PB_ADMIN_ENFORCE_SINGLE" = "true" ]; then
     done
     wal_ckpt
     start_temp
-    # refresh token (not strictly needed)
     AUTH_JSON="$(try_auth)"
     ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
   fi
@@ -241,7 +240,6 @@ META_FILE="$(mktemp)"; STOR_FILE="$(mktemp)"; BACK_FILE="$(mktemp)"
 DESIRED_FILE="$(mktemp)"; DESIRED_TRIM_FILE="$(mktemp)"
 LIVE_FILE="$(mktemp)"; LIVE_TRIM_FILE="$(mktemp)"
 
-# Build desired
 jq -n --arg url "$PB_PUBLIC_URL" '{meta:{appName:"PocketBase",appUrl:$url}}' > "$META_FILE"
 
 if [ "$PB_S3_STORAGE_ENABLED" = "true" ] \
@@ -273,10 +271,8 @@ else
 fi
 
 jq -s 'add' "$META_FILE" "$STOR_FILE" "$BACK_FILE" > "$DESIRED_FILE"
-# Trim to the subset we control and sort keys for stable comparison
 jq '{meta:{appUrl:.meta.appUrl}, s3, backups}' "$DESIRED_FILE" | jq -S . > "$DESIRED_TRIM_FILE"
 
-# Fetch live settings and project the same shape
 curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
   "http://127.0.0.1:${BOOT_PORT}/api/settings" > "$LIVE_FILE"
 jq '{meta:{appUrl:.meta.appUrl}, s3, backups}' "$LIVE_FILE" | jq -S . > "$LIVE_TRIM_FILE"
@@ -298,11 +294,9 @@ else
   echo "[settings] No settings changes."
 fi
 
-# Cleanup stateless temp files
 rm -f "$META_FILE" "$STOR_FILE" "$BACK_FILE" "$DESIRED_FILE" "$DESIRED_TRIM_FILE" \
       "$LIVE_FILE" "$LIVE_TRIM_FILE" /tmp/pb_patch_code.txt 2>/dev/null || true
 
-# Cleanup temp PB and start real server
 stop_temp
 echo "[bootstrap] Done."
 
