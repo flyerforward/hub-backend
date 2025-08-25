@@ -1,9 +1,9 @@
 services:
-  pocketbased:
+  pocketbase:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: pocketbase
+    #container_name: pocketbase
     command: ["/app/entrypoint.sh"]
     environment:
       # Dokploy will inject your .env automatically if configured
