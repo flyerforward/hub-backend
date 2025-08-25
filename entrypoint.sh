@@ -1,8 +1,9 @@
 #!/usr/bin/env sh
 set -euo pipefail
+
 [ "${PB_DEBUG:-false}" = "true" ] && set -x
 
-echo "[boot] entrypoint v7.32 (stateless, wait-for-core-migrations) loaded"
+echo "[boot] entrypoint v7.24 (stateless, no-restore) loaded"
 
 ############################################
 # Required env
@@ -10,15 +11,16 @@ echo "[boot] entrypoint v7.32 (stateless, wait-for-core-migrations) loaded"
 : "${PB_ADMIN_EMAIL:?Set PB_ADMIN_EMAIL}"
 : "${PB_ADMIN_PASSWORD:?Set PB_ADMIN_PASSWORD}"
 
+# Behavior flags
 PB_ADMIN_RESET_MODE="${PB_ADMIN_RESET_MODE:-single}"   # single|all
 PB_ADMIN_ENFORCE_SINGLE="${PB_ADMIN_ENFORCE_SINGLE:-true}"
 
+# Public URL + optional encryption
+PB_PUBLIC_URL="${PB_PUBLIC_URL:-http://127.0.0.1:8090}"
+PB_PUBLIC_URL="${PB_PUBLIC_URL%/}"
 PB_ENCRYPTION="${PB_ENCRYPTION:-}"
 ENCRYPTION_ARG=""
 [ -n "$PB_ENCRYPTION" ] && ENCRYPTION_ARG="--encryptionEnv PB_ENCRYPTION"
-
-PB_PUBLIC_URL="${PB_PUBLIC_URL:-http://127.0.0.1:8090}"
-PB_PUBLIC_URL="${PB_PUBLIC_URL%/}"
 
 # S3 storage (uploads)
 PB_S3_STORAGE_ENABLED="${PB_S3_STORAGE_ENABLED:-true}"
@@ -29,7 +31,7 @@ PB_S3_STORAGE_ACCESS_KEY="${PB_S3_STORAGE_ACCESS_KEY:-}"
 PB_S3_STORAGE_SECRET="${PB_S3_STORAGE_SECRET:-}"
 PB_S3_STORAGE_FORCE_PATH_STYLE="${PB_S3_STORAGE_FORCE_PATH_STYLE:-false}"
 
-# S3 backups (PocketBase cron config only — no restore here)
+# S3 backups (handled by PB itself via cron)
 PB_S3_BACKUPS_ENABLED="${PB_S3_BACKUPS_ENABLED:-true}"
 PB_S3_BACKUPS_BUCKET="${PB_S3_BACKUPS_BUCKET:-}"
 PB_S3_BACKUPS_REGION="${PB_S3_BACKUPS_REGION:-}"
@@ -40,6 +42,7 @@ PB_S3_BACKUPS_FORCE_PATH_STYLE="${PB_S3_BACKUPS_FORCE_PATH_STYLE:-false}"
 PB_BACKUPS_CRON="${PB_BACKUPS_CRON:-0 3 * * *}"
 PB_BACKUPS_MAX_KEEP="${PB_BACKUPS_MAX_KEEP:-7}"
 
+# Escaped admin email for SQL
 ESC_EMAIL="$(printf "%s" "$PB_ADMIN_EMAIL" | sed "s/'/''/g")"
 
 ############################################
@@ -53,82 +56,98 @@ sql() { sqlite3 /pb_data/data.db "$1"; }
 wal_ckpt() { sqlite3 /pb_data/data.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true; }
 
 ############################################
-# Start a single temp PB and wait for core migrations
+# Init core + migrations (one-time fire)
+############################################
+INIT_PORT=8097
+echo "[init] Starting PB once on :${INIT_PORT}…"
+/app/pocketbase $ENCRYPTION_ARG --dev --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
+  serve --http 127.0.0.1:${INIT_PORT} >/tmp/pb_init.log 2>&1 &
+INIT_PID=$!
+for i in $(seq 1 120); do
+  sleep 0.25
+  if curl -fsS "http://127.0.0.1:${INIT_PORT}/api/health" >/dev/null 2>&1; then sleep 0.5; break; fi
+  [ "$i" -eq 120 ] && echo "[init] PB failed to start" && cat /tmp/pb_init.log && exit 1
+done
+kill $INIT_PID; wait $INIT_PID 2>/dev/null || true
+echo "[init] Core/migrations initialized."
+
+############################################
+# Temp PB helpers + login test/repair
 ############################################
 BOOT_PORT=8099
 start_temp() {
   /app/pocketbase $ENCRYPTION_ARG --dev --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
     serve --http 127.0.0.1:${BOOT_PORT} >/tmp/pb_bootstrap.log 2>&1 &
   PB_PID=$!
-  # Wait for HTTP health
-  for i in $(seq 1 160); do
+  for i in $(seq 1 120); do
     sleep 0.25
-    if curl -fsS "http://127.0.0.1:${BOOT_PORT}/api/health" >/dev/null 2>&1; then break; fi
-    [ "$i" -eq 160 ] && echo "[bootstrap] PB failed to start" && tail -n 200 /tmp/pb_bootstrap.log || true
+    if curl -fsS "http://127.0.0.1:${BOOT_PORT}/api/health" >/dev/null 2>&1; then return 0; fi
   done
-  # Now wait for core tables (avoid race with internal Go migrations)
-  echo "[bootstrap] Waiting for core tables…"
-  for i in $(seq 1 200); do
-    # Does _admins exist?
-    if [ "$(sql "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_admins';" 2>/dev/null || echo 0)" -gt 0 ]; then
-      # Also ensure _params exists (settings table)
-      if [ "$(sql "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_params';" 2>/dev/null || echo 0)" -gt 0 ]; then
-        return 0
-      fi
-    fi
-    sleep 0.25
-  done
-  echo "[bootstrap] Core tables not detected in time."
-  return 1
+  echo "[bootstrap] PB failed to start"; tail -n 200 /tmp/pb_bootstrap.log || true; return 1
 }
 stop_temp() { kill $PB_PID 2>/dev/null || true; wait $PB_PID 2>/dev/null || true; }
-
-echo "[bootstrap] Starting temp PB…"
-start_temp || { echo "[bootstrap] start failed"; tail -n 200 /tmp/pb_bootstrap.log || true; exit 1; }
-echo "[bootstrap] Core ready."
-
-############################################
-# Admin login/repair (use the running temp PB)
-############################################
 AUTH_BODY="$(jq -n --arg id "$PB_ADMIN_EMAIL" --arg pw "$PB_ADMIN_PASSWORD" '{identity:$id, password:$pw}')"
 try_auth() {
   curl -sS -X POST "http://127.0.0.1:${BOOT_PORT}/api/admins/auth-with-password" \
     -H "Content-Type: application/json" --data-binary "$AUTH_BODY" || true
 }
 
+echo "[auth] Starting temp PB for login test…"
+start_temp
 AUTH_JSON="$(try_auth)"
 ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
 
 if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
-  echo "[auth] Login failed → repairing/creating admin…"
+  echo "[auth] Login failed → repairing admin in-place if possible."
+  stop_temp
 
   EXISTS="$(sql "SELECT COUNT(*) FROM _admins WHERE email='$ESC_EMAIL';" 2>/dev/null || echo 0)"
   if [ "${EXISTS:-0}" -gt 0 ]; then
-    echo "[admin] Env admin exists → update password."
+    echo "[admin] Env admin exists → attempting password update."
     /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
       admin update "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_update.log 2>&1 || true
-    cat /tmp/pb_admin_update.log || true
-  else
-    echo "[admin] Env admin does not exist → create."
-    if [ "$PB_ADMIN_RESET_MODE" = "all" ]; then
-      for em in $(sql "SELECT email FROM _admins;"); do
-        echo "[admin] Deleting: $em"
-        /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-          admin delete "$em" >/tmp/pb_admin_delete.log 2>&1 || true
-      done
-      wal_ckpt
-    fi
-    /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-      admin create "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_create.log 2>/dev/null || true
-    cat /tmp/pb_admin_create.log || true
-  fi
+    echo "[admin] update output:"; cat /tmp/pb_admin_update.log || true
 
-  # Re-test login
-  AUTH_JSON="$(try_auth)"
-  ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
-  if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
-    echo "[auth] Auth still failing; aborting."; tail -n 200 /tmp/pb_bootstrap.log || true
-    stop_temp; exit 1
+    start_temp
+    AUTH_JSON="$(try_auth)"
+    ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
+    if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
+      echo "[admin] Update didn’t fix it → deleting and recreating admin."
+      stop_temp
+      /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
+        admin delete "$PB_ADMIN_EMAIL" >/tmp/pb_admin_delete.log 2>&1 || true
+      # If row still present, hard delete via SQL
+      COUNT_AFTER_CLI="$(sql "SELECT COUNT(*) FROM _admins WHERE email='$ESC_EMAIL';" 2>/dev/null || echo 0)"
+      [ "$COUNT_AFTER_CLI" -gt 0 ] && sql "DELETE FROM _admins WHERE email='$ESC_EMAIL';"
+      wal_ckpt
+
+      echo "[admin] Creating env admin ${PB_ADMIN_EMAIL}"
+      /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
+        admin create "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_create.log 2>&1 || true
+      cat /tmp/pb_admin_create.log || true
+
+      start_temp
+      AUTH_JSON="$(try_auth)"
+      ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
+      if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
+        echo "[auth] Auth still failing after recreate; aborting."; tail -n 200 /tmp/pb_bootstrap.log || true
+        stop_temp; exit 1
+      fi
+    fi
+
+  else
+    echo "[admin] Env admin does not exist → creating."
+    /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
+      admin create "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_create.log 2>&1 || true
+    cat /tmp/pb_admin_create.log || true
+
+    start_temp
+    AUTH_JSON="$(try_auth)"
+    ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
+    if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
+      echo "[auth] Auth still failing after create; aborting."; tail -n 200 /tmp/pb_bootstrap.log || true
+      stop_temp; exit 1
+    fi
   fi
 else
   echo "[auth] Login test succeeded."
@@ -141,27 +160,31 @@ if [ "$PB_ADMIN_ENFORCE_SINGLE" = "true" ]; then
   COUNT="$(sql "SELECT COUNT(*) FROM _admins;")"
   if [ "${COUNT:-0}" -gt 1 ]; then
     echo "[admin] Enforcing single admin: deleting non-env admins."
+    stop_temp
     for em in $(sql "SELECT email FROM _admins WHERE email != '$ESC_EMAIL';"); do
       echo "[admin] Deleting: $em"
       /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
         admin delete "$em" >/tmp/pb_admin_delete.log 2>&1 || true
     done
     wal_ckpt
-    # refresh token (not strictly needed)
+    start_temp
+    # refresh token (optional)
     AUTH_JSON="$(try_auth)"
     ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
   fi
 fi
 
 ############################################
-# Settings (stateless): build → GET → trim → diff → PATCH if changed
+# Settings (STATELESS): build → diff → PATCH
 ############################################
 META_FILE="$(mktemp)"; STOR_FILE="$(mktemp)"; BACK_FILE="$(mktemp)"
 DESIRED_FILE="$(mktemp)"; DESIRED_TRIM_FILE="$(mktemp)"
 LIVE_FILE="$(mktemp)"; LIVE_TRIM_FILE="$(mktemp)"
 
+# meta
 jq -n --arg url "$PB_PUBLIC_URL" '{meta:{appName:"PocketBase",appUrl:$url}}' > "$META_FILE"
 
+# storage
 if [ "$PB_S3_STORAGE_ENABLED" = "true" ] \
    && [ -n "$PB_S3_STORAGE_BUCKET" ] && [ -n "$PB_S3_STORAGE_REGION" ] \
    && [ -n "$PB_S3_STORAGE_ENDPOINT" ] && [ -n "$PB_S3_STORAGE_ACCESS_KEY" ] \
@@ -175,6 +198,7 @@ else
   echo '{}' > "$STOR_FILE"
 fi
 
+# backups
 if [ "$PB_S3_BACKUPS_ENABLED" = "true" ] \
    && [ -n "$PB_S3_BACKUPS_BUCKET" ] && [ -n "$PB_S3_BACKUPS_REGION" ] \
    && [ -n "$PB_S3_BACKUPS_ENDPOINT" ] && [ -n "$PB_S3_BACKUPS_ACCESS_KEY" ] \
@@ -190,13 +214,16 @@ else
   echo '{}' > "$BACK_FILE"
 fi
 
+# desired combined + trimmed for stable compare
 jq -s 'add' "$META_FILE" "$STOR_FILE" "$BACK_FILE" > "$DESIRED_FILE"
 jq '{meta:{appUrl:.meta.appUrl}, s3, backups}' "$DESIRED_FILE" | jq -S . > "$DESIRED_TRIM_FILE"
 
+# live → trimmed same shape
 curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
   "http://127.0.0.1:${BOOT_PORT}/api/settings" > "$LIVE_FILE"
 jq '{meta:{appUrl:.meta.appUrl}, s3, backups}' "$LIVE_FILE" | jq -S . > "$LIVE_TRIM_FILE"
 
+# patch if needed
 if ! diff -q "$DESIRED_TRIM_FILE" "$LIVE_TRIM_FILE" >/dev/null 2>&1; then
   echo "[settings] Applying settings changes…"
   PATCH_OUT="$(mktemp)"; PATCH_CODE=0
@@ -214,13 +241,15 @@ else
   echo "[settings] No settings changes."
 fi
 
-# Stop temp and start the real server
+# cleanup temp files + temp PB
 rm -f "$META_FILE" "$STOR_FILE" "$BACK_FILE" "$DESIRED_FILE" "$DESIRED_TRIM_FILE" \
       "$LIVE_FILE" "$LIVE_TRIM_FILE" /tmp/pb_patch_code.txt 2>/dev/null || true
-
 stop_temp
 echo "[bootstrap] Done."
 
+############################################
+# Start the real server
+############################################
 exec /app/pocketbase $ENCRYPTION_ARG \
   --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
   serve --http 0.0.0.0:8090
