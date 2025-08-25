@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -euo pipefail
 
-echo "[boot] entrypoint v7.15 loaded"
+echo "[boot] entrypoint v7.16 (stateless) loaded"
 
 ############################################
 # Env
@@ -58,14 +58,15 @@ if [ -z "$AWS_S3_ENDPOINT" ]; then
   if [ -n "${PB_S3_BACKUPS_ENDPOINT:-}" ]; then AWS_S3_ENDPOINT="$PB_S3_BACKUPS_ENDPOINT"; else AWS_S3_ENDPOINT="$PB_S3_STORAGE_ENDPOINT"; fi
 fi
 
+# Always-available escaped admin email
+ESC_EMAIL="$(printf "%s" "$PB_ADMIN_EMAIL" | sed "s/'/''/g")"
+
 ############################################
 # Tools & dirs
 ############################################
-apk add --no-cache aws-cli unzip curl jq rsync sqlite coreutils >/dev/null 2>&1 || true
-mkdir -p /pb_data /pb_migrations /pb_state
+apk add --no-cache aws-cli unzip curl jq rsync sqlite coreutils diffutils >/dev/null 2>&1 || true
+mkdir -p /pb_data /pb_migrations
 [ -d /app/pb_migrations ] && rsync -a --update /app/pb_migrations/ /pb_migrations/
-
-SETTINGS_SHA_FILE="/pb_state/.settings_sha256"
 
 sql() { sqlite3 /pb_data/data.db "$1"; }
 wal_ckpt() { sqlite3 /pb_data/data.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true; }
@@ -142,7 +143,6 @@ if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
   stop_temp
 
   # 1) Does env admin exist?
-  ESC_EMAIL="$(printf "%s" "$PB_ADMIN_EMAIL" | sed "s/'/''/g")"
   EXISTS="$(sql "SELECT COUNT(*) FROM _admins WHERE email='$ESC_EMAIL';" 2>/dev/null || echo 0)"
 
   if [ "${EXISTS:-0}" -gt 0 ]; then
@@ -234,9 +234,14 @@ if [ "$PB_ADMIN_ENFORCE_SINGLE" = "true" ]; then
 fi
 
 ############################################
-# Settings: hash + PATCH only if changed
+# Settings (STATELESS):
+#   Build desired JSON → GET live → trim both → compare → PATCH if different
 ############################################
 META_FILE="$(mktemp)"; STOR_FILE="$(mktemp)"; BACK_FILE="$(mktemp)"
+DESIRED_FILE="$(mktemp)"; DESIRED_TRIM_FILE="$(mktemp)"
+LIVE_FILE="$(mktemp)"; LIVE_TRIM_FILE="$(mktemp)"
+
+# Build desired
 jq -n --arg url "$PB_PUBLIC_URL" '{meta:{appName:"PocketBase",appUrl:$url}}' > "$META_FILE"
 
 if [ "$PB_S3_STORAGE_ENABLED" = "true" ] \
@@ -248,7 +253,9 @@ if [ "$PB_S3_STORAGE_ENABLED" = "true" ] \
     --arg e "$PB_S3_STORAGE_ENDPOINT" --arg ak "$PB_S3_STORAGE_ACCESS_KEY" \
     --arg sk "$PB_S3_STORAGE_SECRET" --argjson fps "$PB_S3_STORAGE_FORCE_PATH_STYLE" \
     '{s3:{enabled:true,bucket:$b,region:$r,endpoint:$e,accessKey:$ak,secret:$sk,forcePathStyle:$fps}}' > "$STOR_FILE"
-else echo '{}' > "$STOR_FILE"; fi
+else
+  echo '{}' > "$STOR_FILE"
+fi
 
 if [ "$PB_S3_BACKUPS_ENABLED" = "true" ] \
    && [ -n "$PB_S3_BACKUPS_BUCKET" ] && [ -n "$PB_S3_BACKUPS_REGION" ] \
@@ -261,16 +268,20 @@ if [ "$PB_S3_BACKUPS_ENABLED" = "true" ] \
     --arg e "$PB_S3_BACKUPS_ENDPOINT" --arg ak "$PB_S3_BACKUPS_ACCESS_KEY" \
     --arg sk "$PB_S3_BACKUPS_SECRET" --argjson fps "$PB_S3_BACKUPS_FORCE_PATH_STYLE" \
     '{backups:{cron:$cron,cronMaxKeep:$keep,s3:{enabled:true,bucket:$b,region:$r,endpoint:$e,accessKey:$ak,secret:$sk,forcePathStyle:$fps}}}' > "$BACK_FILE"
-else echo '{}' > "$BACK_FILE"; fi
+else
+  echo '{}' > "$BACK_FILE"
+fi
 
-DESIRED_FILE="$(mktemp)"
 jq -s 'add' "$META_FILE" "$STOR_FILE" "$BACK_FILE" > "$DESIRED_FILE"
-DESIRED_TRIM_FILE="$(mktemp)"
+# Trim to the subset we control and sort keys for stable comparison
 jq '{meta:{appUrl:.meta.appUrl}, s3, backups}' "$DESIRED_FILE" | jq -S . > "$DESIRED_TRIM_FILE"
-DESIRED_SHA="$(sha256sum "$DESIRED_TRIM_FILE" | awk '{print $1}')"
-PREV_SHA="$(cat "$SETTINGS_SHA_FILE" 2>/dev/null || echo "")"
 
-if [ "$DESIRED_SHA" != "$PREV_SHA" ]; then
+# Fetch live settings and project the same shape
+curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "http://127.0.0.1:${BOOT_PORT}/api/settings" > "$LIVE_FILE"
+jq '{meta:{appUrl:.meta.appUrl}, s3, backups}' "$LIVE_FILE" | jq -S . > "$LIVE_TRIM_FILE"
+
+if ! diff -q "$DESIRED_TRIM_FILE" "$LIVE_TRIM_FILE" >/dev/null 2>&1; then
   echo "[settings] Applying settings changes…"
   PATCH_OUT="$(mktemp)"; PATCH_CODE=0
   cat "$DESIRED_FILE" | curl -sS -w "%{http_code}" -o "$PATCH_OUT" \
@@ -283,13 +294,15 @@ if [ "$DESIRED_SHA" != "$PREV_SHA" ]; then
     echo "--- bootstrap.log (tail) ---"; tail -n 200 /tmp/pb_bootstrap.log || true
     stop_temp; exit 1
   fi
-  echo "$DESIRED_SHA" > "$SETTINGS_SHA_FILE"
 else
   echo "[settings] No settings changes."
 fi
 
-# Cleanup temp resources, start real server
-rm -f "$META_FILE" "$STOR_FILE" "$BACK_FILE" "$DESIRED_FILE" "$DESIRED_TRIM_FILE" /tmp/pb_patch_code.txt 2>/dev/null || true
+# Cleanup stateless temp files
+rm -f "$META_FILE" "$STOR_FILE" "$BACK_FILE" "$DESIRED_FILE" "$DESIRED_TRIM_FILE" \
+      "$LIVE_FILE" "$LIVE_TRIM_FILE" /tmp/pb_patch_code.txt 2>/dev/null || true
+
+# Cleanup temp PB and start real server
 stop_temp
 echo "[bootstrap] Done."
 
