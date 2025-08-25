@@ -1,11 +1,13 @@
 #!/usr/bin/env sh
 set -euo pipefail
-[ "${PB_DEBUG:-false}" = "true" ] && set -x
-echo "[boot] entrypoint v9.2 (shell-only, force-migrate, temp-admin settings, no-restore) loaded"
 
-# -----------------------------
-# Optional encryption + public URL
-# -----------------------------
+[ "${PB_DEBUG:-false}" = "true" ] && set -x
+
+echo "[boot] entrypoint v7.40 (stateless, temp service-admin for settings) loaded"
+
+############################################
+# Required env (no PB_ADMIN_* anymore)
+############################################
 PB_ENCRYPTION="${PB_ENCRYPTION:-}"
 ENCRYPTION_ARG=""
 [ -n "$PB_ENCRYPTION" ] && ENCRYPTION_ARG="--encryptionEnv PB_ENCRYPTION"
@@ -13,9 +15,7 @@ ENCRYPTION_ARG=""
 PB_PUBLIC_URL="${PB_PUBLIC_URL:-http://127.0.0.1:8090}"
 PB_PUBLIC_URL="${PB_PUBLIC_URL%/}"
 
-# -----------------------------
-# Desired settings from env
-# -----------------------------
+# S3 storage (uploads)
 PB_S3_STORAGE_ENABLED="${PB_S3_STORAGE_ENABLED:-true}"
 PB_S3_STORAGE_BUCKET="${PB_S3_STORAGE_BUCKET:-}"
 PB_S3_STORAGE_REGION="${PB_S3_STORAGE_REGION:-}"
@@ -24,6 +24,7 @@ PB_S3_STORAGE_ACCESS_KEY="${PB_S3_STORAGE_ACCESS_KEY:-}"
 PB_S3_STORAGE_SECRET="${PB_S3_STORAGE_SECRET:-}"
 PB_S3_STORAGE_FORCE_PATH_STYLE="${PB_S3_STORAGE_FORCE_PATH_STYLE:-false}"
 
+# S3 backups (PocketBase cron)
 PB_S3_BACKUPS_ENABLED="${PB_S3_BACKUPS_ENABLED:-true}"
 PB_S3_BACKUPS_BUCKET="${PB_S3_BACKUPS_BUCKET:-}"
 PB_S3_BACKUPS_REGION="${PB_S3_BACKUPS_REGION:-}"
@@ -34,96 +35,77 @@ PB_S3_BACKUPS_FORCE_PATH_STYLE="${PB_S3_BACKUPS_FORCE_PATH_STYLE:-false}"
 PB_BACKUPS_CRON="${PB_BACKUPS_CRON:-0 3 * * *}"
 PB_BACKUPS_MAX_KEEP="${PB_BACKUPS_MAX_KEEP:-7}"
 
-# -----------------------------
+############################################
 # Tools & dirs
-# -----------------------------
-apk add --no-cache curl jq coreutils >/dev/null 2>&1 || true
+############################################
+apk add --no-cache curl jq sqlite coreutils diffutils rsync >/dev/null 2>&1 || true
 mkdir -p /pb_data /pb_migrations
+[ -d /app/pb_migrations ] && rsync -a --update /app/pb_migrations/ /pb_migrations/
 
-health_wait() {
-  local url="$1" tries="${2:-120}"
-  for i in $(seq 1 "$tries"); do
-    sleep 0.25
-    curl -fsS "$url" >/dev/null 2>&1 && return 0
-  done
-  return 1
-}
-gen_pass() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24; echo; }
+sql() { sqlite3 /pb_data/data.db "$1"; }
 
-force_migrate_up() {
-  echo "[migrate] pocketbase migrate up (offline)…"
-  /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations migrate up >/tmp/pb_migrate1.log 2>&1 || true
-  tail -n +1 /tmp/pb_migrate1.log 2>/dev/null || true
-}
-
-# -----------------------------
-# 1) FORCE migrations init first (fixes “Migration are not initialized yet”)
-# -----------------------------
-force_migrate_up
-
-# -----------------------------
-# 2) Briefly boot PB to materialize base tables, then stop
-# -----------------------------
+############################################
+# 1) Init core + migrations (one-time kick)
+############################################
 INIT_PORT=8097
 echo "[init] Starting PB once on :${INIT_PORT}…"
 /app/pocketbase $ENCRYPTION_ARG --dev --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
   serve --http 127.0.0.1:${INIT_PORT} >/tmp/pb_init.log 2>&1 &
 INIT_PID=$!
-if ! health_wait "http://127.0.0.1:${INIT_PORT}/api/health" 160; then
-  echo "[init] PB failed to come up:"; tail -n 200 /tmp/pb_init.log || true
-  kill $INIT_PID 2>/dev/null || true
-  exit 1
-fi
-sleep 0.5
-kill $INIT_PID 2>/dev/null || true; wait $INIT_PID 2>/dev/null || true
-echo "[init] Base init done."
+for i in $(seq 1 120); do
+  sleep 0.25
+  if curl -fsS "http://127.0.0.1:${INIT_PORT}/api/health" >/dev/null 2>&1; then sleep 0.5; break; fi
+  [ "$i" -eq 120 ] && echo "[init] PB failed to start" && cat /tmp/pb_init.log && exit 1
+done
+kill $INIT_PID; wait $INIT_PID 2>/dev/null || true
+echo "[init] Core/migrations initialized."
 
-# Run migrate again post-initial-boot (covers versions that register migrations at first serve)
-echo "[migrate] pocketbase migrate up (post-init)…"
-/app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations migrate up >/tmp/pb_migrate2.log 2>&1 || true
-tail -n +1 /tmp/pb_migrate2.log 2>/dev/null || true
+############################################
+# 2) Create a temporary service admin via CLI
+############################################
+SERVICE_ADMIN_EMAIL="setup-$(date +%s)@local"
+# generate a 24-char alnum password
+SERVICE_ADMIN_PASSWORD="$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)"
 
-# -----------------------------
-# 3) Temp admin → settings → cleanup
-# -----------------------------
-TMP_EMAIL="svc-setup-$(date +%s)-$RANDOM@local.invalid"
-TMP_PASS="$(gen_pass)"
-echo "[admin] Creating temporary admin: $TMP_EMAIL"
+echo "[setup] Creating temp service admin: ${SERVICE_ADMIN_EMAIL}"
 /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-  admin create "$TMP_EMAIL" "$TMP_PASS" >/tmp/pb_admin_create.log 2>&1 || true
-# If the CLI still complains about migrations, run migrate once more and retry once.
-if grep -qi "migrate up" /tmp/pb_admin_create.log 2>/dev/null; then
-  echo "[admin] Retry after migrate hint from CLI…"
-  /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations migrate up >/tmp/pb_migrate3.log 2>&1 || true
-  /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-    admin create "$TMP_EMAIL" "$TMP_PASS" >/tmp/pb_admin_create2.log 2>&1 || true
-fi
+  admin create "$SERVICE_ADMIN_EMAIL" "$SERVICE_ADMIN_PASSWORD" >/tmp/pb_admin_create.log 2>&1 || true
+cat /tmp/pb_admin_create.log || true
 
+############################################
+# 3) Start PB on localhost and auth as service admin
+############################################
 BOOT_PORT=8099
-echo "[auth] Starting temp PB on :${BOOT_PORT}…"
-/app/pocketbase $ENCRYPTION_ARG --dev --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
-  serve --http 127.0.0.1:${BOOT_PORT} >/tmp/pb_bootstrap.log 2>&1 &
-PB_PID=$!
-if ! health_wait "http://127.0.0.1:${BOOT_PORT}/api/health" 160; then
-  echo "[auth] Temp PB failed to start"; tail -n 200 /tmp/pb_bootstrap.log || true
-  kill $PB_PID 2>/dev/null || true
-  exit 1
-fi
+start_temp() {
+  /app/pocketbase $ENCRYPTION_ARG --dev --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
+    serve --http 127.0.0.1:${BOOT_PORT} >/tmp/pb_bootstrap.log 2>&1 &
+  PB_PID=$!
+  for i in $(seq 1 120); do
+    sleep 0.25
+    if curl -fsS "http://127.0.0.1:${BOOT_PORT}/api/health" >/dev/null 2>&1; then return 0; fi
+  done
+  echo "[bootstrap] PB failed to start"; tail -n 200 /tmp/pb_bootstrap.log || true; return 1
+}
+stop_temp() { kill $PB_PID 2>/dev/null || true; wait $PB_PID 2>/dev/null || true; }
 
-AUTH_BODY="$(jq -n --arg id "$TMP_EMAIL" --arg pw "$TMP_PASS" '{identity:$id, password:$pw}')"
-AUTH_JSON="$(curl -sS -X POST "http://127.0.0.1:${BOOT_PORT}/api/admins/auth-with-password" \
-  -H "Content-Type: application/json" --data-binary "$AUTH_BODY" || true)"
+AUTH_BODY="$(jq -n --arg id "$SERVICE_ADMIN_EMAIL" --arg pw "$SERVICE_ADMIN_PASSWORD" '{identity:$id, password:$pw}')"
+try_auth() {
+  curl -sS -X POST "http://127.0.0.1:${BOOT_PORT}/api/admins/auth-with-password" \
+    -H "Content-Type: application/json" --data-binary "$AUTH_BODY" || true
+}
+
+echo "[auth] Starting temp PB for settings patch…"
+start_temp
+AUTH_JSON="$(try_auth)"
 ADMIN_TOKEN="$(echo "$AUTH_JSON" | jq -r .token 2>/dev/null || echo "")"
 if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
-  echo "[auth] ERROR: temp admin auth failed."
-  tail -n 80 /tmp/pb_admin_create.log 2>/dev/null || true
-  tail -n 80 /tmp/pb_admin_create2.log 2>/dev/null || true
-  kill $PB_PID 2>/dev/null || true
-  exit 1
+  echo "[auth] ERROR: Service admin auth failed."; tail -n 200 /tmp/pb_bootstrap.log || true
+  stop_temp; exit 1
 fi
-echo "[auth] Temp admin authenticated."
 
-# Build desired settings
+############################################
+# 4) Build desired settings → GET live → diff → PATCH
+############################################
 META_FILE="$(mktemp)"; STOR_FILE="$(mktemp)"; BACK_FILE="$(mktemp)"
 DESIRED_FILE="$(mktemp)"; DESIRED_TRIM_FILE="$(mktemp)"
 LIVE_FILE="$(mktemp)"; LIVE_TRIM_FILE="$(mktemp)"
@@ -161,7 +143,6 @@ fi
 jq -s 'add' "$META_FILE" "$STOR_FILE" "$BACK_FILE" > "$DESIRED_FILE"
 jq '{meta:{appUrl:.meta.appUrl}, s3, backups}' "$DESIRED_FILE" | jq -S . > "$DESIRED_TRIM_FILE"
 
-# GET live + compare + PATCH
 curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
   "http://127.0.0.1:${BOOT_PORT}/api/settings" > "$LIVE_FILE"
 jq '{meta:{appUrl:.meta.appUrl}, s3, backups}' "$LIVE_FILE" | jq -S . > "$LIVE_TRIM_FILE"
@@ -176,32 +157,40 @@ if ! diff -q "$DESIRED_TRIM_FILE" "$LIVE_TRIM_FILE" >/dev/null 2>&1; then
   HTTP_CODE="$(cat /tmp/pb_patch_code.txt || echo 000)"
   if [ "$PATCH_CODE" -ne 0 ] || [ "$HTTP_CODE" -ge 400 ]; then
     echo "[settings] PATCH failed (HTTP $HTTP_CODE). Response:"; cat "$PATCH_OUT"
-    kill $PB_PID 2>/dev/null || true
-    exit 1
+    echo "--- bootstrap.log (tail) ---"; tail -n 200 /tmp/pb_bootstrap.log || true
+    stop_temp; exit 1
   fi
 else
   echo "[settings] No settings changes."
 fi
 
-# Stop temp PB
-kill $PB_PID 2>/dev/null || true; wait $PB_PID 2>/dev/null || true
-
-# Delete temp admin
-echo "[admin] Deleting temporary admin: $TMP_EMAIL"
-/app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-  admin delete "$TMP_EMAIL" >/tmp/pb_admin_delete.log 2>&1 || true
-
-# Cleanup
+# Clean temp files
 rm -f "$META_FILE" "$STOR_FILE" "$BACK_FILE" "$DESIRED_FILE" "$DESIRED_TRIM_FILE" \
-      "$LIVE_FILE" "$LIVE_TRIM_FILE" /tmp/pb_patch_code.txt \
-      /tmp/pb_admin_create.log /tmp/pb_admin_create2.log /tmp/pb_admin_delete.log \
-      /tmp/pb_migrate1.log /tmp/pb_migrate2.log /tmp/pb_migrate3.log \
-      /tmp/pb_init.log /tmp/pb_bootstrap.log 2>/dev/null || true
+      "$LIVE_FILE" "$LIVE_TRIM_FILE" /tmp/pb_patch_code.txt 2>/dev/null || true
 
-# -----------------------------
-# 4) Start PB for real
-# -----------------------------
-echo "[boot] Launching PocketBase on :8090"
+############################################
+# 5) Stop temp PB and delete the service admin
+############################################
+stop_temp
+echo "[setup] Deleting temp service admin: ${SERVICE_ADMIN_EMAIL}"
+/app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
+  admin delete "$SERVICE_ADMIN_EMAIL" >/tmp/pb_admin_delete.log 2>&1 || true
+cat /tmp/pb_admin_delete.log || true
+
+# If row still exists (paranoia), hard-delete via SQLite
+COUNT_AFTER_CLI="$(sql "SELECT COUNT(*) FROM _admins WHERE email='$(printf "%s" "$SERVICE_ADMIN_EMAIL" | sed "s/'/''/g")';" 2>/dev/null || echo 0)"
+if [ "${COUNT_AFTER_CLI:-0}" -gt 0 ]; then
+  echo "[setup] CLI delete didn’t remove row → deleting with SQLite."
+  sql "DELETE FROM _admins WHERE email='$(printf "%s" "$SERVICE_ADMIN_EMAIL" | sed "s/'/''/g")';" || true
+fi
+
+echo "[setup] Service admin removed. UI will present initial admin creation on first visit."
+
+############################################
+# 6) Start the real server
+############################################
+echo "[bootstrap] Done."
+
 exec /app/pocketbase $ENCRYPTION_ARG \
   --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
   serve --http 0.0.0.0:8090
