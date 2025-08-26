@@ -3,12 +3,11 @@ set -euo pipefail
 
 [ "${PB_DEBUG:-false}" = "true" ] && set -x
 
-echo "[boot] entrypoint v7.25 (stateless, temp-admin bootstrap, no-restore) loaded"
+echo "[boot] entrypoint v7.26 (stateless, temp-admin bootstrap, zero-admin supported) loaded"
 
 ############################################
 # Env (no admin creds needed)
 ############################################
-# Public URL + optional encryption
 PB_PUBLIC_URL="${PB_PUBLIC_URL:-http://127.0.0.1:8090}"
 PB_PUBLIC_URL="${PB_PUBLIC_URL%/}"
 PB_ENCRYPTION="${PB_ENCRYPTION:-}"
@@ -46,7 +45,7 @@ sql() { sqlite3 /pb_data/data.db "$1"; }
 wal_ckpt() { sqlite3 /pb_data/data.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true; }
 
 ############################################
-# Init core + migrations (one-time fire)
+# Init core + migrations (one-time)
 ############################################
 INIT_PORT=8097
 echo "[init] Starting PB once on :${INIT_PORT}…"
@@ -77,7 +76,6 @@ start_temp() {
 }
 stop_temp() { kill $PB_PID 2>/dev/null || true; wait $PB_PID 2>/dev/null || true; }
 
-# Auth with temp admin
 auth_token() {
   local email="$1" pw="$2"
   local body; body="$(jq -n --arg id "$email" --arg pw "$pw" '{identity:$id, password:$pw}')"
@@ -86,19 +84,26 @@ auth_token() {
 }
 
 ############################################
+# Track existing admins BEFORE we create temp
+############################################
+EXISTING_COUNT="$(sql "SELECT COUNT(*) FROM _admins;" 2>/dev/null || echo 0)"
+echo "[temp-admin] Pre-existing admins: ${EXISTING_COUNT:-0}"
+
+############################################
 # Create temporary service admin
 ############################################
-# Generate unique email/password
 RANDHEX="$(head -c16 /dev/urandom | od -An -t x1 | tr -d ' \n')"
 TEMP_ADMIN_EMAIL="admin-${RANDHEX}@service.local"
 TEMP_ADMIN_PASSWORD="$(head -c24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c32)"
+ESC_TEMP_EMAIL="$(printf "%s" "$TEMP_ADMIN_EMAIL" | sed "s/'/''/g")"
 
-# Safety: ensure not colliding (ultra unlikely, but cheap check)
-EXISTS="$(sql "SELECT COUNT(*) FROM _admins WHERE email='${TEMP_ADMIN_EMAIL//\'/\'\'}';" 2>/dev/null || echo 0)"
+# Collision check (ultra unlikely)
+EXISTS="$(sql "SELECT COUNT(*) FROM _admins WHERE email='${ESC_TEMP_EMAIL}';" 2>/dev/null || echo 0)"
 if [ "${EXISTS:-0}" -gt 0 ]; then
-  echo "[temp-admin] Collision on generated email (unlikely). Regenerating…"
   RANDHEX="$(head -c16 /dev/urandom | od -An -t x1 | tr -d ' \n')"
   TEMP_ADMIN_EMAIL="admin-${RANDHEX}@service.local"
+  TEMP_ADMIN_PASSWORD="$(head -c24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c32)"
+  ESC_TEMP_EMAIL="$(printf "%s" "$TEMP_ADMIN_EMAIL" | sed "s/'/''/g")"
 fi
 
 echo "[temp-admin] Creating temporary admin: $TEMP_ADMIN_EMAIL"
@@ -106,19 +111,17 @@ echo "[temp-admin] Creating temporary admin: $TEMP_ADMIN_EMAIL"
   admin create "$TEMP_ADMIN_EMAIL" "$TEMP_ADMIN_PASSWORD" >/tmp/pb_admin_create.log 2>&1 || true
 cat /tmp/pb_admin_create.log || true
 
-# Ensure temp server running for API
 echo "[bootstrap] Starting temp PB for settings apply…"
 start_temp
 
-# Get token
 ADMIN_TOKEN="$(auth_token "$TEMP_ADMIN_EMAIL" "$TEMP_ADMIN_PASSWORD")"
 if [ -z "$ADMIN_TOKEN" ]; then
   echo "[temp-admin] ERROR: could not authenticate temp admin."
   tail -n 200 /tmp/pb_bootstrap.log || true
   stop_temp
-  # Best-effort cleanup (delete temp admin offline)
-  /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-    admin delete "$TEMP_ADMIN_EMAIL" >/tmp/pb_admin_delete.log 2>&1 || true
+  # best-effort cleanup via SQL (in case it's the only admin)
+  sql "DELETE FROM _admins WHERE email='${ESC_TEMP_EMAIL}';" || true
+  wal_ckpt
   exit 1
 fi
 
@@ -162,11 +165,11 @@ else
   echo '{}' > "$BACK_FILE"
 fi
 
-# desired combined + trimmed for stable compare
+# desired combined + trimmed for compare
 jq -s 'add' "$META_FILE" "$STOR_FILE" "$BACK_FILE" > "$DESIRED_FILE"
 jq '{meta:{appUrl:.meta.appUrl}, s3, backups}' "$DESIRED_FILE" | jq -S . > "$DESIRED_TRIM_FILE"
 
-# live → trimmed same shape
+# live → same shape
 curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
   "http://127.0.0.1:${BOOT_PORT}/api/settings" > "$LIVE_FILE"
 jq '{meta:{appUrl:.meta.appUrl}, s3, backups}' "$LIVE_FILE" | jq -S . > "$LIVE_TRIM_FILE"
@@ -183,11 +186,15 @@ if ! diff -q "$DESIRED_TRIM_FILE" "$LIVE_TRIM_FILE" >/dev/null 2>&1; then
   if [ "$PATCH_CODE" -ne 0 ] || [ "$HTTP_CODE" -ge 400 ]; then
     echo "[settings] PATCH failed (HTTP $HTTP_CODE). Response:"; cat "$PATCH_OUT"
     echo "--- bootstrap.log (tail) ---"; tail -n 200 /tmp/pb_bootstrap.log || true
-
-    # Cleanup temp PB & temp admin before exit
     stop_temp
-    /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-      admin delete "$TEMP_ADMIN_EMAIL" >/tmp/pb_admin_delete.log 2>&1 || true
+    # clean up temp admin safely (use SQL if it's the only one)
+    if [ "${EXISTING_COUNT:-0}" -gt 0 ]; then
+      /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
+        admin delete "$TEMP_ADMIN_EMAIL" >/tmp/pb_admin_delete.log 2>&1 || true
+    else
+      sql "DELETE FROM _admins WHERE email='${ESC_TEMP_EMAIL}';" || true
+      wal_ckpt
+    fi
     exit 1
   fi
 else
@@ -202,10 +209,16 @@ rm -f "$META_FILE" "$STOR_FILE" "$BACK_FILE" "$DESIRED_FILE" "$DESIRED_TRIM_FILE
 # Tear down temp PB and remove temp admin
 ############################################
 stop_temp
-echo "[temp-admin] Deleting temporary admin: $TEMP_ADMIN_EMAIL"
-/app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-  admin delete "$TEMP_ADMIN_EMAIL" >/tmp/pb_admin_delete.log 2>&1 || true
-cat /tmp/pb_admin_delete.log || true
+if [ "${EXISTING_COUNT:-0}" -gt 0 ]; then
+  echo "[temp-admin] Deleting temporary admin via CLI (other admins exist)."
+  /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
+    admin delete "$TEMP_ADMIN_EMAIL" >/tmp/pb_admin_delete.log 2>&1 || true
+  cat /tmp/pb_admin_delete.log || true
+else
+  echo "[temp-admin] Removing the only admin via direct SQL to leave zero-admin state."
+  sql "DELETE FROM _admins WHERE email='${ESC_TEMP_EMAIL}';" || true
+  wal_ckpt
+fi
 
 echo "[bootstrap] Done."
 
