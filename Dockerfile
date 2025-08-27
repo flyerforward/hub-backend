@@ -7,9 +7,6 @@ SHELL ["/bin/sh", "-c"]
 RUN set -a && . ./config.env && set +a && \
     : "${PB_VERSION:=${PB_VERSION}}" && echo "PB_VERSION=$PB_VERSION"
 
-# Go build tools
-RUN apk add --no-cache go build-base git
-
 WORKDIR /app
 
 # Tools needed by entrypoint/bootstrap
