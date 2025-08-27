@@ -50,7 +50,7 @@ HOOK_TMP="$(mktemp)"
 cat >"$HOOK_TMP" <<'EOF'
 ["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"].forEach((method) => {
   routerAdd(method, "/_/*", (c) => c.json(404, { message: 'Admin UI is disabled in production. Manage schema migrations via pb-dev.' }))
-}
+});
 EOF
 # Atomic replace to avoid stale content
 mv -f "$HOOK_TMP" /app/pb_hooks/disable_admin_ui.pb.js
