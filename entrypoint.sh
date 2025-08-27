@@ -186,7 +186,7 @@ printf '%s\n' "$IMG_SCHEMA_HASH" > "$LAST_IMG_FILE"
 #    Call this after your init/bootstrap step applies migrations, or right before final exec if you only run serve once.
 if [ "${MIG_DIR:-/app/pb_migrations}" = "/app/pb_migrations" ]; then
   printf '%s\n' "$IMG_SCHEMA_HASH" > "$DB_SCHEMA_FILE"
-fi
+fi 
 
 
 
