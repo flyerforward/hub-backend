@@ -41,15 +41,65 @@ PB_BACKUPS_MAX_KEEP="${PB_BACKUPS_MAX_KEEP:-7}"
 
 
 
-# compute a single hash over all migration files in the image
-SCHEMA_HASH="$( (cd /app/pb_migrations && \
-  find . -type f -name '*.js' -print0 | sort -z | xargs -0 cat | sha256sum | awk '{print $1}') )"
+############################################
+# Schema-hash gate (blocks admin on mismatch)
+############################################
 
-# write the image-side hash (always)
-printf '%s\n' "$SCHEMA_HASH" > /app/pb_hooks/.schema_hash
+# 1) Compute image-side schema hash from /app/pb_migrations
+#    (filenames should not contain spaces; KISS)
+FILES="$(find /app/pb_migrations -type f -name '*.js' | sort)"
+if [ -n "$FILES" ]; then
+  IMG_SCHEMA_HASH="$(cat $FILES | sha256sum | awk '{print $1}')"
+else
+  IMG_SCHEMA_HASH="no_migrations"
+fi
 
-# only write the DB-side copy if it doesn't exist yet (avoid clobbering a restored value)
-[ -f /pb_data/.schema_hash ] || printf '%s\n' "$SCHEMA_HASH" > /pb_data/.schema_hash
+# 2) Read DB-side schema hash (from backups). If missing, initialize to image.
+DB_SCHEMA_FILE="/pb_data/.schema_hash"
+if [ -f "$DB_SCHEMA_FILE" ]; then
+  DB_SCHEMA_HASH="$(cat "$DB_SCHEMA_FILE" 2>/dev/null || true)"
+else
+  DB_SCHEMA_HASH="$IMG_SCHEMA_HASH"
+  printf '%s\n' "$DB_SCHEMA_HASH" > "$DB_SCHEMA_FILE"
+fi
+
+# 3) Generate a tiny hook based on (mis)match
+HOOK="/app/pb_hooks/admin_schema_gate.pb.js"
+TMP_HOOK="$(mktemp)"
+
+if [ -n "$IMG_SCHEMA_HASH" ] && [ -n "$DB_SCHEMA_HASH" ] && [ "$IMG_SCHEMA_HASH" != "$DB_SCHEMA_HASH" ]; then
+  # MISMATCH → block admin UI + admin API and SKIP migrations this boot
+  cat >"$TMP_HOOK" <<EOF
+// auto-generated schema mismatch gate
+function _deny(c){
+  var body={
+    code:"schema_mismatch",
+    message:"This database schema differs from the running image. Deploy a build whose migrations hash matches 'expected_schema' to re-enable Admin UI.",
+    expected_schema:"$DB_SCHEMA_HASH",
+    running_schema:"$IMG_SCHEMA_HASH"
+  };
+  try{ return c.json(body,409);}catch(_){}
+  try{ return c.json(409,body);}catch(_){}
+  return;
+}
+try{ routerAdd("GET","/_/*",_deny);}catch(_){}
+try{ routerAdd("HEAD","/_/*",_deny);}catch(_){}
+;["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"].forEach(function(m){
+  try{ routerAdd(m,"/api/admins/*",_deny);}catch(_){}
+});
+EOF
+  echo "[schema-gate] MISMATCH: DB=$DB_SCHEMA_HASH, IMG=$IMG_SCHEMA_HASH → admin routes disabled; skipping migrations."
+  MIG_DIR="/app/pb_migrations_off"; mkdir -p "$MIG_DIR"
+else
+  # MATCH → no-op hook; allow migrations from the real dir
+  echo "// schema gate: no mismatch (DB=$DB_SCHEMA_HASH, IMG=$IMG_SCHEMA_HASH)" >"$TMP_HOOK"
+  echo "[schema-gate] OK: DB and image schema match."
+  MIG_DIR="/app/pb_migrations"
+fi
+
+# Atomic replace so it never goes stale
+mv -f "$TMP_HOOK" "$HOOK"
+
 
 
 
