@@ -48,13 +48,25 @@ wal_ckpt() { sqlite3 /pb_data/data.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/n
 ############################################
 HOOK_TMP="$(mktemp)"
 cat >"$HOOK_TMP" <<'EOF'
-["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"].forEach((method) => {
-  routerAdd(method, "/_/*", (c) => c.json(404, { message: 'Admin UI is disabled in production. Manage schema migrations via pb-dev.' }))
-});
+function deny(c) {
+  const body = { code: "schema_locked", message: "Schema/config changes are disabled in this environment." };
+  try { return c.json(body, 403); } catch (_) {}
+  try { return c.json(403, body); } catch (_) {}
+  try { if (c?.response) { c.response.status = 403; return c.response.json ? c.response.json(body) : undefined; } } catch (_) {}
+  return; // last resort
+}
+
+// --- Collections schema ops ---
+routerAdd("POST",   "/api/collections",        deny);      // create collection
+routerAdd("PATCH",  "/api/collections/:id",    deny);      // update collection
+routerAdd("DELETE", "/api/collections/:id",    deny);      // delete collection
+routerAdd("POST",   "/api/collections/import", deny);
+routerAdd("POST",   "/api/collections/export", deny);
+routerAdd("POST",   "/api/collections/truncate", deny);
 EOF
 # Atomic replace to avoid stale content
-mv -f "$HOOK_TMP" /app/pb_hooks/disable_admin_ui.pb.js
-echo "[hooks] Wrote /app/pb_hooks/disable_admin_ui.pb.js (KISS: routerAdd GET /_/*)"
+mv -f "$HOOK_TMP" /app/pb_hooks/disable_collections_changes.pb.js
+echo "[hooks] Wrote /app/pb_hooks/disable_collections_changes.js (KISS: routerAdd GET /_/*)"
 
 ############################################
 # Init core + migrations (one-time)
