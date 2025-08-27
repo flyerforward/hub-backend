@@ -44,7 +44,7 @@ sql() { sqlite3 /pb_data/data.db "$1"; }
 wal_ckpt() { sqlite3 /pb_data/data.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true; }
 
 ############################################
-# Write the simplest possible Admin UI killer hook (always overwrite)
+# Write the disable_collections_changes.pb.js hook file (disable collections changes for production admin UI)
 ############################################
 HOOK_TMP="$(mktemp)"
 cat >"$HOOK_TMP" <<'EOF'
