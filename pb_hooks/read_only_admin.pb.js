@@ -1,66 +1,64 @@
 /// <reference path="../pb_data/types.d.ts" />
 /**
- * Read-only schema guard (env-free, defensive).
- * Blocks schema/admin/settings mutations; allows record CRUD.
- * Works even if the JS ctx lacks `next()`.
+ * Production "read-only admin" guard.
+ * - Allows normal record CRUD: /api/collections/<name>/records...
+ * - Blocks schema/admin/settings/logs mutations that would create migrations or change config.
  */
 
-(() => {
+onBeforeServe(({ router /*, db, app */ }) => {
   // Allow normal record CRUD under /api/collections/<name>/records...
-  const allowRecords = /^\/api\/collections\/[^/]+\/records(\/|$)/i;
+  const allowRecords = /^\/api\/collections\/[^/]+\/records(?:\/|$)/i;
 
-  // Block schema/admin/settings mutations
+  // Block schema/admin/settings mutations (be slightly over-inclusive on /api/collections/*)
   const blocked = [
-    /^\/api\/collections\/?$/i,                         // POST create collection
-    /^\/api\/collections\/[^/]+$/i,                     // PATCH/DELETE a collection
-    /^\/api\/collections\/(import|export|truncate)(\/|$)/i,
-    /^\/api\/settings$/i,                               // PATCH settings
-    /^\/api\/admins(\/|$)/i,                            // admin management
-    /^\/api\/logs(\/|$)/i                               // defensive
+    // collection schema ops (create/update/delete/import/export/truncate, etc.)
+    /^\/api\/collections(?:\/(?![^/]+\/records)(?:.*))?$/i,
+    /^\/api\/collections\/(import|export|truncate)(?:\/|$)/i,
+
+    // settings & admins management
+    /^\/api\/settings(?:\/|$)/i,
+    /^\/api\/admins(?:\/|$)/i,
+
+    // optional: logs writes/cleanups (defensive)
+    /^\/api\/logs(?:\/|$)/i,
   ];
 
-  routerUse((ctx) => {
+  router.use((c, next) => {
     try {
-      const method = String(ctx?.request?.method || "").toUpperCase();
+      const method = String(c?.request?.method || "").toUpperCase();
+
+      // Only police mutating verbs
       if (method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE") {
         const path =
-          ctx?.request?.path ??
-          ctx?.request?.url?.pathname ??
-          ctx?.request?.url?.path ??
+          c?.request?.path ??
+          c?.request?.url?.pathname ??
+          c?.request?.url?.path ??
           "";
 
-        // Allow record operations (add/edit/delete rows)
+        // Explicitly allow record CRUD
         if (allowRecords.test(path)) {
-          // pass-through without assuming next()
-          if (typeof ctx?.next === "function") return ctx.next();
-          return;
+          return next();
         }
 
         // Block schema/admin/settings writes
         for (const rx of blocked) {
           if (rx.test(path)) {
-            if (ctx?.response) {
-              ctx.response.status = 403;
-              if (typeof ctx?.response?.json === "function") {
-                return ctx.response.json({
-                  code: "read_only_admin",
-                  message: "Schema/config changes are disabled in this environment."
-                });
-              }
-            }
-            // Fallback: no response helpers; do nothing (PB will default to 403-less, but at least we won't crash)
-            return;
+            return c.json(403, {
+              code: "read_only_admin",
+              message: "Schema/config changes are disabled in this environment.",
+            });
           }
         }
       }
-    } catch (err) {
-      try { console.log("[read-only-admin] middleware error:", err && (err.message || err)); } catch (_) {}
-    }
 
-    // Non-mutating or non-blocked routes: pass-through (if possible)
-    if (typeof ctx?.next === "function") return ctx.next();
-    return;
+      // Everything else passes through (e.g., GET /api/health)
+      return next();
+    } catch (err) {
+      // Never break the router stack on errors
+      try { console.log("[read-only-admin] middleware error:", err && (err.message || err)); } catch (_) {}
+      return next();
+    }
   });
 
-  try { console.log("[read-only-admin] enabled (defensive)"); } catch (_) {}
-})();
+  try { console.log("[read-only-admin] enabled"); } catch (_) {}
+});
