@@ -2,7 +2,7 @@
 set -euo pipefail
 [ "${PB_DEBUG:-false}" = "true" ] && set -x
 
-echo "[boot] entrypoint v8.3 (pb_data migrations, restore-aware gate, JSON via c.text, schema-locked admin UI)"
+echo "[boot] entrypoint v8.4 (pb_data migrations, restore-aware gate, visible UI message, schema-locked admin UI)"
 
 ############################################
 # Env (no admin creds needed)
@@ -81,7 +81,7 @@ fi
 LATCH_FILE="/pb_data/.mig_gate_latched"
 GATED=0; [ -f "$LATCH_FILE" ] && GATED=1
 
-# auto-detect a restore: data hash changed but image hash same as last boot
+# auto-detect a restore: data hash changed but image hash is same as last boot
 if [ "$DATA_HASH" != "$IMG_HASH" ] && [ "$LAST_IMG_HASH" = "$IMG_HASH" ]; then
   GATED=1
   printf '1\n' > "$LATCH_FILE"
@@ -93,7 +93,7 @@ HOOK="/app/pb_hooks/admin_schema_gate.pb.js"
 TMP_HOOK="$(mktemp)"
 
 if [ "$GATED" -eq 1 ] && [ "$DATA_HASH" != "$IMG_HASH" ]; then
-  # RESTORE path: DO NOT overwrite restored migrations; block admin UI/API with helpful JSON
+  # RESTORE path: DO NOT overwrite restored migrations; block admin UI/API with helpful message
   LAST_FILE="$(ls -1 "$data_dir" 2>/dev/null | sort | tail -n1 || true)"
   PREVIEW=""
   if [ -n "$LAST_FILE" ] && [ -f "$data_dir/$LAST_FILE" ]; then
@@ -102,22 +102,56 @@ if [ "$GATED" -eq 1 ] && [ "$DATA_HASH" != "$IMG_HASH" ]; then
   cat >"$TMP_HOOK" <<EOF
 // auto-generated: schema mismatch gate (RESTORE latched)
 (function(){
-  function deny(c){
-    var body = {
+  function sendText(c, status, msg){
+    try { return c.text(msg, status); } catch(_){}
+    try {
+      if (c && c.response) { c.response.status = status; }
+      return msg; // fallback: return body string
+    } catch(_) {}
+    return;
+  }
+  function sendJSON(c, status, payload){
+    var s = JSON.stringify(payload);
+    try { return c.text(s, status); } catch(_){}
+    try {
+      if (c && c.response) { c.response.status = status; }
+      return s;
+    } catch(_) {}
+    return;
+  }
+
+  // Human-friendly page for Admin UI (browser actually renders 200 text)
+  function denyUI(c){
+    var lines = [
+      "Admin UI temporarily disabled due to schema mismatch after a restore.",
+      "",
+      "expected_schema: $DATA_HASH",
+      "running_schema:  $IMG_HASH",
+      "last_restored_migration: $LAST_FILE",
+      "",
+      "Fix:",
+      " - Deploy a build whose /app/pb_migrations matches 'expected_schema',",
+      " - OR copy /pb_data/pb_migrations into your repo and redeploy."
+    ];
+    return sendText(c, 200, lines.join("\\n"));
+  }
+
+  // Programmatic response for Admin API
+  function denyAPI(c){
+    return sendJSON(c, 403, {
       code: "schema_mismatch",
       message: "This database was restored. The migrations in /pb_data/pb_migrations differ from the running image. Deploy a build whose migrations match 'expected_schema' OR copy the restored migrations into your repo and redeploy.",
       expected_schema: "$DATA_HASH",
       running_schema: "$IMG_HASH",
       last_restored_migration: "$LAST_FILE",
       last_restored_migration_preview: "$PREVIEW"
-    };
-    try { return c.text(JSON.stringify(body), 409); } catch (_){}
-    return;
+    });
   }
-  try{ routerAdd("GET","/_/*",deny);}catch(_){}
-  try{ routerAdd("HEAD","/_/*",deny);}catch(_){}
+
+  try{ routerAdd("GET","/_/*",denyUI);}catch(_){}
+  try{ routerAdd("HEAD","/_/*",denyUI);}catch(_){}
   ;["GET","POST","PUT","PATCH","DELETE"].forEach(function(m){
-    try{ routerAdd(m,"/api/admins/*",deny);}catch(_){}
+    try{ routerAdd(m,"/api/admins/*",denyAPI);}catch(_){}
   });
 })();
 EOF
