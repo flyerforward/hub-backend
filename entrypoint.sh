@@ -45,7 +45,7 @@ wal_ckpt() { sqlite3 /pb_data/data.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/n
 
 # ---- write the simplest possible admin-UI killer hook ----
 cat >/app/pb_hooks/disable_admin_ui.pb.js <<'EOF'
-routerAdd("GET","/_/", function(c){ return send404(c); });
+routerAdd("GET", "/_/*", c => c.json({ code: "admin_ui_disabled", message: "Admin UI is disabled in production. Manage schema via migrations only." }, 404));
 EOF
 echo "[hooks] Wrote /app/pb_hooks/disable_admin_ui.pb.js (KISS: routerAdd GET /_/ only)"
 
