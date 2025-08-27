@@ -2,7 +2,7 @@
 set -euo pipefail
 [ "${PB_DEBUG:-false}" = "true" ] && set -x
 
-echo "[boot] entrypoint v8.4 (pb_data migrations, restore-aware gate, visible UI message, schema-locked admin UI)"
+echo "[boot] entrypoint v8.5 (pb_data migrations, restore-aware gate on base admin path, visible UI message, schema-locked admin API)"
 
 ############################################
 # Env (no admin creds needed)
@@ -104,15 +104,17 @@ if [ "$GATED" -eq 1 ] && [ "$DATA_HASH" != "$IMG_HASH" ]; then
 (function(){
   function sendText(c, status, msg){
     try { return c.text(msg, status); } catch(_){}
+    try { return c.text(status, msg); } catch(_){}
     try {
       if (c && c.response) { c.response.status = status; }
-      return msg; // fallback: return body string
+      return String(msg);
     } catch(_) {}
     return;
   }
   function sendJSON(c, status, payload){
     var s = JSON.stringify(payload);
     try { return c.text(s, status); } catch(_){}
+    try { return c.text(status, s); } catch(_){}
     try {
       if (c && c.response) { c.response.status = status; }
       return s;
@@ -120,7 +122,7 @@ if [ "$GATED" -eq 1 ] && [ "$DATA_HASH" != "$IMG_HASH" ]; then
     return;
   }
 
-  // Human-friendly page for Admin UI (browser actually renders 200 text)
+  // Human-friendly page for only the BASE Admin UI routes.
   function denyUI(c){
     var lines = [
       "Admin UI temporarily disabled due to schema mismatch after a restore.",
@@ -148,14 +150,21 @@ if [ "$GATED" -eq 1 ] && [ "$DATA_HASH" != "$IMG_HASH" ]; then
     });
   }
 
-  try{ routerAdd("GET","/_/*",denyUI);}catch(_){}
-  try{ routerAdd("HEAD","/_/*",denyUI);}catch(_){}
+  // Intercept *only* the base UI entry routes so the message is visible.
+  try{ routerAdd("GET",  "/_",               denyUI);}catch(_){}
+  try{ routerAdd("HEAD", "/_",               denyUI);}catch(_){}
+  try{ routerAdd("GET",  "/_/",              denyUI);}catch(_){}
+  try{ routerAdd("HEAD", "/_/",              denyUI);}catch(_){}
+  try{ routerAdd("GET",  "/_/index.html",    denyUI);}catch(_){}
+  try{ routerAdd("HEAD", "/_/index.html",    denyUI);}catch(_){}
+
+  // Intercept Admin API calls programmatically
   ;["GET","POST","PUT","PATCH","DELETE"].forEach(function(m){
     try{ routerAdd(m,"/api/admins/*",denyAPI);}catch(_){}
   });
 })();
 EOF
-  echo "[gate] GATED: using RESTORED migrations at $data_dir; Admin UI/API blocked."
+  echo "[gate] GATED: using RESTORED migrations at $data_dir; Admin UI base path blocked, Admin API returns 403 JSON."
   MIG_DIR="$data_dir"
 else
   # normal or reconciled: sync image -> data and allow admin
@@ -180,10 +189,18 @@ printf '%s\n' "$(_hash_dir "$data_dir")" > /pb_data/.schema_hash
 HOOK_TMP="$(mktemp)"
 cat >"$HOOK_TMP" <<'EOF'
 (function(){
-  function deny(c) {
-    var body = { code: "schema_locked", message: "Schema/config changes are disabled in this environment." };
-    try { return c.text(JSON.stringify(body), 403); } catch (_){}
+  function sendJSON403(c, body){
+    var s = JSON.stringify(body || { code: "schema_locked" });
+    try { return c.text(s, 403); } catch(_){}
+    try { return c.text(403, s); } catch(_){}
+    try { if (c && c.response) { c.response.status = 403; } return s; } catch(_){}
     return;
+  }
+  function deny(c) {
+    return sendJSON403(c, {
+      code: "schema_locked",
+      message: "Schema/config changes are disabled in this environment."
+    });
   }
   routerAdd("POST",   "/api/collections",           deny);
   routerAdd("PATCH",  "/api/collections/:id",       deny);
