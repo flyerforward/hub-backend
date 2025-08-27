@@ -1,21 +1,15 @@
 /// <reference path="../pb_data/types.d.ts" />
 /**
- * Read-only schema guard for production.
- * Set PB_READONLY_ADMIN=true to enable.
+ * Read-only schema guard (always enabled).
  * Blocks schema/admin/settings mutations but allows record CRUD.
+ * Works on PocketBase 0.22.x with JS hooks.
  */
 
 (() => {
-  const enabled = (env("PB_READONLY_ADMIN") || "").toLowerCase() === "true";
-  if (!enabled) {
-    console.log("[read-only-admin] disabled");
-    return;
-  }
-
-  // Anything under /api/collections/{name}/records is allowed (CRUD rows)
+  // Allow normal record CRUD under /api/collections/<name>/records...
   const allowRecords = /^\/api\/collections\/[^/]+\/records(\/|$)/i;
 
-  // Endpoints that mutate schema/admin/settings (block these)
+  // Block schema/admin/settings mutations
   const blocked = [
     /^\/api\/collections\/?$/i,                         // POST create collection
     /^\/api\/collections\/[^/]+$/i,                     // PATCH/DELETE a collection
@@ -25,21 +19,26 @@
     /^\/api\/logs(\/|$)/i                               // defensive
   ];
 
-  routerUse((e) => {
+  routerUse((ctx) => {
     try {
-      const m = (e.request?.method || "").toUpperCase();
-      if (m === "POST" || m === "PUT" || m === "PATCH" || m === "DELETE") {
-        const p = e.request?.path || e.request?.url?.path || e.request?.url?.pathname || "";
+      const method = (ctx.request?.method || "").toUpperCase();
+      if (method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE") {
+        const path =
+          ctx.request?.path ||
+          ctx.request?.url?.pathname ||
+          ctx.request?.url?.path ||
+          "";
 
-        // Allow normal record operations
-        if (allowRecords.test(p)) {
-          return e.next();
+        // Allow all record operations (add/edit/delete rows)
+        if (allowRecords.test(path)) {
+          return ctx.next();
         }
 
         // Block schema/admin/settings writes
-        for (let rx of blocked) {
-          if (rx.test(p)) {
-            return e.json(403, {
+        for (const rx of blocked) {
+          if (rx.test(path)) {
+            ctx.response.status = 403;
+            return ctx.response.json({
               code: "read_only_admin",
               message: "Schema/config changes are disabled in this environment."
             });
@@ -48,10 +47,10 @@
       }
     } catch (err) {
       // Never break server startup on hook errors
-      console.log("[read-only-admin] middleware error:", err && (err.message || err));
+      try { console.log("[read-only-admin] middleware error:", err && (err.message || err)); } catch (_) {}
     }
-    return e.next();
+    return ctx.next();
   });
 
-  console.log("[read-only-admin] enabled");
+  try { console.log("[read-only-admin] enabled (env-free)"); } catch (_) {}
 })();
