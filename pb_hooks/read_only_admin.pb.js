@@ -1,8 +1,8 @@
 /// <reference path="../pb_data/types.d.ts" />
 /**
- * Read-only schema guard (always enabled).
- * Blocks schema/admin/settings mutations but allows record CRUD.
- * Works on PocketBase 0.22.x with JS hooks.
+ * Read-only schema guard (env-free, defensive).
+ * Blocks schema/admin/settings mutations; allows record CRUD.
+ * Works even if the JS ctx lacks `next()`.
  */
 
 (() => {
@@ -21,36 +21,46 @@
 
   routerUse((ctx) => {
     try {
-      const method = (ctx.request?.method || "").toUpperCase();
+      const method = String(ctx?.request?.method || "").toUpperCase();
       if (method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE") {
         const path =
-          ctx.request?.path ||
-          ctx.request?.url?.pathname ||
-          ctx.request?.url?.path ||
+          ctx?.request?.path ??
+          ctx?.request?.url?.pathname ??
+          ctx?.request?.url?.path ??
           "";
 
-        // Allow all record operations (add/edit/delete rows)
+        // Allow record operations (add/edit/delete rows)
         if (allowRecords.test(path)) {
-          return ctx.next();
+          // pass-through without assuming next()
+          if (typeof ctx?.next === "function") return ctx.next();
+          return;
         }
 
         // Block schema/admin/settings writes
         for (const rx of blocked) {
           if (rx.test(path)) {
-            ctx.response.status = 403;
-            return ctx.response.json({
-              code: "read_only_admin",
-              message: "Schema/config changes are disabled in this environment."
-            });
+            if (ctx?.response) {
+              ctx.response.status = 403;
+              if (typeof ctx?.response?.json === "function") {
+                return ctx.response.json({
+                  code: "read_only_admin",
+                  message: "Schema/config changes are disabled in this environment."
+                });
+              }
+            }
+            // Fallback: no response helpers; do nothing (PB will default to 403-less, but at least we won't crash)
+            return;
           }
         }
       }
     } catch (err) {
-      // Never break server startup on hook errors
       try { console.log("[read-only-admin] middleware error:", err && (err.message || err)); } catch (_) {}
     }
-    return ctx.next();
+
+    // Non-mutating or non-blocked routes: pass-through (if possible)
+    if (typeof ctx?.next === "function") return ctx.next();
+    return;
   });
 
-  try { console.log("[read-only-admin] enabled (env-free)"); } catch (_) {}
+  try { console.log("[read-only-admin] enabled (defensive)"); } catch (_) {}
 })();
