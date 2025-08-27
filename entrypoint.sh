@@ -48,7 +48,7 @@ wal_ckpt() { sqlite3 /pb_data/data.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/n
 ############################################
 HOOK_TMP="$(mktemp)"
 cat >"$HOOK_TMP" <<'EOF'
-routerAdd("GET", "/_/*", c => c.json({ code: "admin_ui_disabled", message: "Admin UI is disabled in production. Manage schema migrations via pocketbase-dev." }, 404));
+routerAdd("GET", "/_/*", c => c.json({ code: "admin_ui_disabled", message: "Admin UI is disabled in production. Manage schema migrations via pb-dev." }, 404));
 EOF
 # Atomic replace to avoid stale content
 mv -f "$HOOK_TMP" /app/pb_hooks/disable_admin_ui.pb.js
