@@ -1,17 +1,27 @@
 FROM alpine:3.20
 
-ARG PB_VERSION=0.22.9
+COPY config.env /config.env
+
+# Set PB_VERSION from config.env
+SHELL ["/bin/sh", "-c"]
+RUN set -a && . ./config.env && set +a && \
+    : "${PB_VERSION:=${PB_VERSION}}" && echo "PB_VERSION=$PB_VERSION"
+
 WORKDIR /app
 
 # Tools needed by entrypoint/bootstrap
 RUN apk add --no-cache curl unzip ca-certificates rsync aws-cli jq
 
 # Download PocketBase binary
-RUN curl -L -o pb.zip \
-  "https://github.com/pocketbase/pocketbase/releases/download/v${PB_VERSION}/pocketbase_${PB_VERSION}_linux_amd64.zip" \
-  && unzip pb.zip -d /app \
-  && rm pb.zip \
-  && chmod +x /app/pocketbase
+RUN set -eux; \
+    set -a; . /config.env; set +a; \
+    : "${PB_VERSION:?PB_VERSION must be set in config.env}"; \
+    echo "Downloading PocketBase v${PB_VERSION}"; \
+    curl -fL -o /tmp/pb.zip \
+      "https://github.com/pocketbase/pocketbase/releases/download/v${PB_VERSION}/pocketbase_${PB_VERSION}_linux_amd64.zip"; \
+    unzip -o /tmp/pb.zip -d /app; \
+    rm -f /tmp/pb.zip; \
+    chmod +x /app/pocketbase
 
 # App files
 COPY pb_hooks/      /app/pb_hooks/
