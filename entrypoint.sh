@@ -2,7 +2,7 @@
 set -euo pipefail
 [ "${PB_DEBUG:-false}" = "true" ] && set -x
 
-echo "[boot] entrypoint v8.2 (pb_data migrations, restore-aware gate, JSON hooks, schema-locked admin UI)"
+echo "[boot] entrypoint v8.3 (pb_data migrations, restore-aware gate, JSON via c.text, schema-locked admin UI)"
 
 ############################################
 # Env (no admin creds needed)
@@ -46,7 +46,6 @@ wal_ckpt() { sqlite3 /pb_data/data.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/n
 # Restore-aware schema gate with pb_data migrations
 ############################################
 
-# helpers
 _hash_dir() {
   # hash concatenated *.js (assumes no spaces in filenames)
   local d="$1"
@@ -82,7 +81,7 @@ fi
 LATCH_FILE="/pb_data/.mig_gate_latched"
 GATED=0; [ -f "$LATCH_FILE" ] && GATED=1
 
-# auto-detect a restore: data hash changed but image hash is same as last boot
+# auto-detect a restore: data hash changed but image hash same as last boot
 if [ "$DATA_HASH" != "$IMG_HASH" ] && [ "$LAST_IMG_HASH" = "$IMG_HASH" ]; then
   GATED=1
   printf '1\n' > "$LATCH_FILE"
@@ -103,24 +102,21 @@ if [ "$GATED" -eq 1 ] && [ "$DATA_HASH" != "$IMG_HASH" ]; then
   cat >"$TMP_HOOK" <<EOF
 // auto-generated: schema mismatch gate (RESTORE latched)
 (function(){
-  function send(c, status, payload){
-    try { return new Response(JSON.stringify(payload), {status, headers:{ "Content-Type":"application/json" }}); } catch(_){}
-    try { return c.text(JSON.stringify(payload), status); } catch(_) {}
-    return;
-  }
   function deny(c){
-    return send(c, 409, {
+    var body = {
       code: "schema_mismatch",
       message: "This database was restored. The migrations in /pb_data/pb_migrations differ from the running image. Deploy a build whose migrations match 'expected_schema' OR copy the restored migrations into your repo and redeploy.",
       expected_schema: "$DATA_HASH",
       running_schema: "$IMG_HASH",
       last_restored_migration: "$LAST_FILE",
       last_restored_migration_preview: "$PREVIEW"
-    });
+    };
+    try { return c.text(JSON.stringify(body), 409); } catch (_){}
+    return;
   }
   try{ routerAdd("GET","/_/*",deny);}catch(_){}
   try{ routerAdd("HEAD","/_/*",deny);}catch(_){}
-  ;["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"].forEach(function(m){
+  ;["GET","POST","PUT","PATCH","DELETE"].forEach(function(m){
     try{ routerAdd(m,"/api/admins/*",deny);}catch(_){}
   });
 })();
@@ -150,16 +146,10 @@ printf '%s\n' "$(_hash_dir "$data_dir")" > /pb_data/.schema_hash
 HOOK_TMP="$(mktemp)"
 cat >"$HOOK_TMP" <<'EOF'
 (function(){
-  function send(c, status, payload){
-    try { return new Response(JSON.stringify(payload), {status, headers:{ "Content-Type":"application/json" }}); } catch(_){}
-    try { return c.text(JSON.stringify(payload), status); } catch(_) {}
-    return;
-  }
   function deny(c) {
-    return send(c, 403, {
-      code: "schema_locked",
-      message: "Schema/config changes are disabled in this environment."
-    });
+    var body = { code: "schema_locked", message: "Schema/config changes are disabled in this environment." };
+    try { return c.text(JSON.stringify(body), 403); } catch (_){}
+    return;
   }
   routerAdd("POST",   "/api/collections",           deny);
   routerAdd("PATCH",  "/api/collections/:id",       deny);
