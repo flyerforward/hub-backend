@@ -1,33 +1,53 @@
+/// <reference path="../pb_data/types.d.ts" />
+/**
+ * Read-only schema guard for production.
+ * Set PB_READONLY_ADMIN=true to enable.
+ * Blocks schema/admin/settings mutations but allows record CRUD.
+ */
 
-routerUse((e) => {
-  const ro = (env("PB_READONLY_ADMIN") || "").toLowerCase() === "true";
-  if (!ro) return e.next();
+onBeforeServe((e) => {
+  const enabled = (env("PB_READONLY_ADMIN") || "").toLowerCase() === "true";
+  if (!enabled) return;
 
-  const m = e.request.method;
-  if (m === "POST" || m === "PUT" || m === "PATCH" || m === "DELETE") {
-    const p = e.request.path;
+  const blocked = [
+    /^\/api\/collections\/?$/i,                       // POST create collection
+    /^\/api\/collections\/[^/]+$/i,                   // PATCH/DELETE collection
+    /^\/api\/collections\/(import|export|truncate)(\/|$)/i,
+    /^\/api\/settings$/i,                             // PATCH settings
+    /^\/api\/admins(\/|$)/i,                          // admin mgmt
+    /^\/api\/logs(\/|$)/i,                            // defensive
+  ];
 
-    // allow records CRUD under /api/collections/<name>/records...
-    const isRecords = /^\/api\/collections\/[^/]+\/records(\/|$)/.test(p);
-    if (isRecords) return e.next();
+  const allowRecordsPrefix = /^\/api\/collections\/[^/]+\/records(\/|$)/i;
 
-    const blocked = [
-      /^\/api\/collections\/?$/,                 // create collection
-      /^\/api\/collections\/[^/]+$/,             // update/delete collection
-      /^\/api\/collections\/(import|export|truncate)(\/|$)/,
-      /^\/api\/settings$/,                       // patch settings
-      /^\/api\/admins(\/|$)/,                    // admin mgmt
-      /^\/api\/logs(\/|$)/,                      // defensive
-    ];
+  e.router.use((c) => {
+    try {
+      const method = c?.request?.method || "";
+      if (method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE") {
+        const path = c?.request?.path || "";
 
-    if (blocked.some(re => re.test(p))) {
-      e.response.status = 403;
-      return e.response.json({
-        code: "read_only_admin",
-        message: "Schema/config changes are disabled in production."
-      });
+        // allow record CRUD
+        if (allowRecordsPrefix.test(path)) {
+          return c.next();
+        }
+
+        // block schema/admin/settings mutations
+        for (let i = 0; i < blocked.length; i++) {
+          if (blocked[i].test(path)) {
+            c.response.status = 403;
+            return c.response.json({
+              code: "read_only_admin",
+              message: "Schema/config changes are disabled in production.",
+            });
+          }
+        }
+      }
+    } catch (err) {
+      // Never crash startup due to hook errors
+      console.log("[read-only-admin] middleware error:", err?.message || err);
     }
-  }
+    return c.next();
+  });
 
-  return e.next();
+  console.log("[read-only-admin] enabled");
 });
