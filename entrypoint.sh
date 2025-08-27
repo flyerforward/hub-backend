@@ -33,6 +33,35 @@ PB_S3_BACKUPS_FORCE_PATH_STYLE="${PB_S3_BACKUPS_FORCE_PATH_STYLE:-false}"
 PB_BACKUPS_CRON="${PB_BACKUPS_CRON:-0 3 * * *}"
 PB_BACKUPS_MAX_KEEP="${PB_BACKUPS_MAX_KEEP:-7}"
 
+
+
+
+
+
+
+
+
+# compute a single hash over all migration files in the image
+SCHEMA_HASH="$( (cd /app/pb_migrations && \
+  find . -type f -name '*.js' -print0 | sort -z | xargs -0 cat | sha256sum | awk '{print $1}') )"
+
+# write the image-side hash (always)
+printf '%s\n' "$SCHEMA_HASH" > /app/pb_hooks/.schema_hash
+
+# only write the DB-side copy if it doesn't exist yet (avoid clobbering a restored value)
+[ -f /pb_data/.schema_hash ] || printf '%s\n' "$SCHEMA_HASH" > /pb_data/.schema_hash
+
+
+
+
+
+
+
+
+
+
+
+
 ############################################
 # Tools & dirs
 ############################################
