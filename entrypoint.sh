@@ -66,7 +66,7 @@ routerAdd("POST",   "/api/collections/truncate", deny);
 EOF
 # Atomic replace to avoid stale content
 mv -f "$HOOK_TMP" /app/pb_hooks/disable_collections_changes.pb.js
-echo "[hooks] Wrote /app/pb_hooks/disable_collections_changes.js (KISS: routerAdd GET /_/*)"
+echo "[hooks] Wrote /app/pb_hooks/disable_collections_changes.js"
 
 ############################################
 # Init core + migrations (one-time)
