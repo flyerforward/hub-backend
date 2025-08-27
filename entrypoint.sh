@@ -42,11 +42,30 @@ PB_BACKUPS_MAX_KEEP="${PB_BACKUPS_MAX_KEEP:-7}"
 
 
 ############################################
-# Schema-hash gate (blocks admin on mismatch)
+# (A) Install the "restore marker" hook (one-liner)
+#     This marks /tmp before PB performs an Admin-UI restore.
+############################################
+cat >/app/pb_hooks/restore_marker.pb.js <<'EOF'
+/// <reference path="../pb_data/types.d.ts" />
+onBackupRestore((e) => {
+  try { $os.writeFile("/tmp/pb_restore_pending", "1", 0o600); } catch (_) {}
+  e.next(); // proceed; PB will restart afterwards
+});
+EOF
+echo "[hooks] restore_marker.pb.js installed"
+
+############################################
+# (B) Schema-hash + restore-aware gating
 ############################################
 
-# 1) Compute image-side schema hash from /app/pb_migrations
-#    (filenames should not contain spaces; KISS)
+# Optionally let ops force a "restore pending" state from env on next boot
+# (e.g., when restoring out-of-band). Use: PB_MARK_RESTORE=1
+if [ "${PB_MARK_RESTORE:-0}" = "1" ]; then
+  echo "[restore] PB_MARK_RESTORE=1 → creating /tmp/pb_restore_pending"
+  printf '1\n' > /tmp/pb_restore_pending
+fi
+
+# 1) Compute image-side schema hash (simple, assumes no spaces in filenames)
 FILES="$(find /app/pb_migrations -type f -name '*.js' | sort)"
 if [ -n "$FILES" ]; then
   IMG_SCHEMA_HASH="$(cat $FILES | sha256sum | awk '{print $1}')"
@@ -54,7 +73,7 @@ else
   IMG_SCHEMA_HASH="no_migrations"
 fi
 
-# 2) Read DB-side schema hash (from backups). If missing, initialize to image.
+# 2) Read/initialize DB-side schema hash (persists in backups)
 DB_SCHEMA_FILE="/pb_data/.schema_hash"
 if [ -f "$DB_SCHEMA_FILE" ]; then
   DB_SCHEMA_HASH="$(cat "$DB_SCHEMA_FILE" 2>/dev/null || true)"
@@ -63,18 +82,18 @@ else
   printf '%s\n' "$DB_SCHEMA_HASH" > "$DB_SCHEMA_FILE"
 fi
 
-# 3) Generate a tiny hook based on (mis)match
+# 3) If a restore is pending, block Admin + skip migrations this boot
+RESTORE_MARK="/tmp/pb_restore_pending"
 HOOK="/app/pb_hooks/admin_schema_gate.pb.js"
 TMP_HOOK="$(mktemp)"
 
-if [ -n "$IMG_SCHEMA_HASH" ] && [ -n "$DB_SCHEMA_HASH" ] && [ "$IMG_SCHEMA_HASH" != "$DB_SCHEMA_HASH" ]; then
-  # MISMATCH → block admin UI + admin API and SKIP migrations this boot
+if [ -f "$RESTORE_MARK" ]; then
   cat >"$TMP_HOOK" <<EOF
-// auto-generated schema mismatch gate
+// auto-generated schema mismatch gate (restore detected)
 function _deny(c){
   var body={
     code:"schema_mismatch",
-    message:"This database schema differs from the running image. Deploy a build whose migrations hash matches 'expected_schema' to re-enable Admin UI.",
+    message:"This database was restored to a different schema. Deploy a build whose migrations hash matches 'expected_schema' to re-enable Admin UI.",
     expected_schema:"$DB_SCHEMA_HASH",
     running_schema:"$IMG_SCHEMA_HASH"
   };
@@ -88,17 +107,18 @@ try{ routerAdd("HEAD","/_/*",_deny);}catch(_){}
   try{ routerAdd(m,"/api/admins/*",_deny);}catch(_){}
 });
 EOF
-  echo "[schema-gate] MISMATCH: DB=$DB_SCHEMA_HASH, IMG=$IMG_SCHEMA_HASH → admin routes disabled; skipping migrations."
+  echo "[schema-gate] RESTORE detected → admin gated, migrations skipped (DB=$DB_SCHEMA_HASH IMG=$IMG_SCHEMA_HASH)"
   MIG_DIR="/app/pb_migrations_off"; mkdir -p "$MIG_DIR"
+  rm -f "$RESTORE_MARK" || true   # one-shot
 else
-  # MATCH → no-op hook; allow migrations from the real dir
-  echo "// schema gate: no mismatch (DB=$DB_SCHEMA_HASH, IMG=$IMG_SCHEMA_HASH)" >"$TMP_HOOK"
-  echo "[schema-gate] OK: DB and image schema match."
+  # Normal deploy path: allow migrations; write a no-op hook
+  echo "// schema gate: normal deploy, no mismatch marker (DB=$DB_SCHEMA_HASH, IMG=$IMG_SCHEMA_HASH)" >"$TMP_HOOK"
   MIG_DIR="/app/pb_migrations"
 fi
 
 # Atomic replace so it never goes stale
 mv -f "$TMP_HOOK" "$HOOK"
+
 
 
 
@@ -331,3 +351,38 @@ echo "[bootstrap] Done."
 exec /app/pocketbase $ENCRYPTION_ARG \
   --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
   serve --http 0.0.0.0:8090
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+if [ "$MIG_DIR" = "/app/pb_migrations" ]; then
+  printf '%s\n' "$IMG_SCHEMA_HASH" > /pb_data/.schema_hash
+fi
