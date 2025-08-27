@@ -5,49 +5,53 @@
  * Blocks schema/admin/settings mutations but allows record CRUD.
  */
 
-onBeforeServe((e) => {
+(() => {
   const enabled = (env("PB_READONLY_ADMIN") || "").toLowerCase() === "true";
-  if (!enabled) return;
+  if (!enabled) {
+    console.log("[read-only-admin] disabled");
+    return;
+  }
 
+  // Anything under /api/collections/{name}/records is allowed (CRUD rows)
+  const allowRecords = /^\/api\/collections\/[^/]+\/records(\/|$)/i;
+
+  // Endpoints that mutate schema/admin/settings (block these)
   const blocked = [
-    /^\/api\/collections\/?$/i,                       // POST create collection
-    /^\/api\/collections\/[^/]+$/i,                   // PATCH/DELETE collection
+    /^\/api\/collections\/?$/i,                         // POST create collection
+    /^\/api\/collections\/[^/]+$/i,                     // PATCH/DELETE a collection
     /^\/api\/collections\/(import|export|truncate)(\/|$)/i,
-    /^\/api\/settings$/i,                             // PATCH settings
-    /^\/api\/admins(\/|$)/i,                          // admin mgmt
-    /^\/api\/logs(\/|$)/i,                            // defensive
+    /^\/api\/settings$/i,                               // PATCH settings
+    /^\/api\/admins(\/|$)/i,                            // admin management
+    /^\/api\/logs(\/|$)/i                               // defensive
   ];
 
-  const allowRecordsPrefix = /^\/api\/collections\/[^/]+\/records(\/|$)/i;
-
-  e.router.use((c) => {
+  routerUse((e) => {
     try {
-      const method = c?.request?.method || "";
-      if (method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE") {
-        const path = c?.request?.path || "";
+      const m = (e.request?.method || "").toUpperCase();
+      if (m === "POST" || m === "PUT" || m === "PATCH" || m === "DELETE") {
+        const p = e.request?.path || e.request?.url?.path || e.request?.url?.pathname || "";
 
-        // allow record CRUD
-        if (allowRecordsPrefix.test(path)) {
-          return c.next();
+        // Allow normal record operations
+        if (allowRecords.test(p)) {
+          return e.next();
         }
 
-        // block schema/admin/settings mutations
-        for (let i = 0; i < blocked.length; i++) {
-          if (blocked[i].test(path)) {
-            c.response.status = 403;
-            return c.response.json({
+        // Block schema/admin/settings writes
+        for (let rx of blocked) {
+          if (rx.test(p)) {
+            return e.json(403, {
               code: "read_only_admin",
-              message: "Schema/config changes are disabled in production.",
+              message: "Schema/config changes are disabled in this environment."
             });
           }
         }
       }
     } catch (err) {
-      // Never crash startup due to hook errors
-      console.log("[read-only-admin] middleware error:", err?.message || err);
+      // Never break server startup on hook errors
+      console.log("[read-only-admin] middleware error:", err && (err.message || err));
     }
-    return c.next();
+    return e.next();
   });
 
   console.log("[read-only-admin] enabled");
-});
+})();
