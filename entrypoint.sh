@@ -187,7 +187,7 @@ printf '%s\n' "$IMG_SCHEMA_HASH" > "$LAST_IMG_FILE"
 if [ "${MIG_DIR:-/app/pb_migrations}" = "/app/pb_migrations" ]; then
   printf '%s\n' "$IMG_SCHEMA_HASH" > "$DB_SCHEMA_FILE"
 fi 
-
+ 
 
 
 
