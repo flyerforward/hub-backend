@@ -2,7 +2,7 @@
 set -euo pipefail
 [ "${PB_DEBUG:-false}" = "true" ] && set -x
 
-echo "[boot] entrypoint v8.1 (pb_data migrations, restore-aware gate, schema-locked admin UI)"
+echo "[boot] entrypoint v8.2 (pb_data migrations, restore-aware gate, JSON hooks, schema-locked admin UI)"
 
 ############################################
 # Env (no admin creds needed)
@@ -82,7 +82,7 @@ fi
 LATCH_FILE="/pb_data/.mig_gate_latched"
 GATED=0; [ -f "$LATCH_FILE" ] && GATED=1
 
-# auto-detect a restore: data hash changed but image hash is the same as last boot
+# auto-detect a restore: data hash changed but image hash is same as last boot
 if [ "$DATA_HASH" != "$IMG_HASH" ] && [ "$LAST_IMG_HASH" = "$IMG_HASH" ]; then
   GATED=1
   printf '1\n' > "$LATCH_FILE"
@@ -103,18 +103,20 @@ if [ "$GATED" -eq 1 ] && [ "$DATA_HASH" != "$IMG_HASH" ]; then
   cat >"$TMP_HOOK" <<EOF
 // auto-generated: schema mismatch gate (RESTORE latched)
 (function(){
-  function deny(c){
-    var body={
-      code:"schema_mismatch",
-      message:"This database was restored. The migrations in /pb_data/pb_migrations differ from the running image. Deploy a build whose migrations match 'expected_schema' OR copy the restored migrations into your repo and redeploy.",
-      expected_schema:"$DATA_HASH",
-      running_schema:"$IMG_HASH",
-      last_restored_migration:"$LAST_FILE",
-      last_restored_migration_preview:"$PREVIEW"
-    };
-    try{ return c.json(body,409);}catch(_){}
-    try{ return c.json(409,body);}catch(_){}
+  function send(c, status, payload){
+    try { return new Response(JSON.stringify(payload), {status, headers:{ "Content-Type":"application/json" }}); } catch(_){}
+    try { return c.text(JSON.stringify(payload), status); } catch(_) {}
     return;
+  }
+  function deny(c){
+    return send(c, 409, {
+      code: "schema_mismatch",
+      message: "This database was restored. The migrations in /pb_data/pb_migrations differ from the running image. Deploy a build whose migrations match 'expected_schema' OR copy the restored migrations into your repo and redeploy.",
+      expected_schema: "$DATA_HASH",
+      running_schema: "$IMG_HASH",
+      last_restored_migration: "$LAST_FILE",
+      last_restored_migration_preview: "$PREVIEW"
+    });
   }
   try{ routerAdd("GET","/_/*",deny);}catch(_){}
   try{ routerAdd("HEAD","/_/*",deny);}catch(_){}
@@ -132,7 +134,7 @@ else
   MIG_DIR="$data_dir"
 
   # clear latch if reconciled
-  if [ "$DATA_HASH" = "$IMG_HASH" ] && [ -f "$LATCH_FILE" ]; then
+  if [ "$(_hash_dir "$data_dir")" = "$IMG_HASH" ] && [ -f "$LATCH_FILE" ]; then
     rm -f "$LATCH_FILE"
     echo "[gate] Reconciled. Gate latch cleared."
   fi
@@ -147,19 +149,25 @@ printf '%s\n' "$(_hash_dir "$data_dir")" > /pb_data/.schema_hash
 ############################################
 HOOK_TMP="$(mktemp)"
 cat >"$HOOK_TMP" <<'EOF'
-function deny(c) {
-  const body = { code: "schema_locked", message: "Schema/config changes are disabled in this environment." };
-  try { return c.json(body, 403); } catch (_) {}
-  try { return c.json(403, body); } catch (_) {}
-  try { if (c?.response) { c.response.status = 403; return c.response.json ? c.response.json(body) : undefined; } } catch (_) {}
-  return;
-}
-routerAdd("POST",   "/api/collections",           deny);
-routerAdd("PATCH",  "/api/collections/:id",       deny);
-routerAdd("DELETE", "/api/collections/:id",       deny);
-routerAdd("POST",   "/api/collections/import",    deny);
-routerAdd("POST",   "/api/collections/export",    deny);
-routerAdd("POST",   "/api/collections/truncate",  deny);
+(function(){
+  function send(c, status, payload){
+    try { return new Response(JSON.stringify(payload), {status, headers:{ "Content-Type":"application/json" }}); } catch(_){}
+    try { return c.text(JSON.stringify(payload), status); } catch(_) {}
+    return;
+  }
+  function deny(c) {
+    return send(c, 403, {
+      code: "schema_locked",
+      message: "Schema/config changes are disabled in this environment."
+    });
+  }
+  routerAdd("POST",   "/api/collections",           deny);
+  routerAdd("PATCH",  "/api/collections/:id",       deny);
+  routerAdd("DELETE", "/api/collections/:id",       deny);
+  routerAdd("POST",   "/api/collections/import",    deny);
+  routerAdd("POST",   "/api/collections/export",    deny);
+  routerAdd("POST",   "/api/collections/truncate",  deny);
+})();
 EOF
 mv -f "$HOOK_TMP" /app/pb_hooks/disable_collections_changes.pb.js
 echo "[hooks] Wrote /app/pb_hooks/disable_collections_changes.pb.js"
@@ -181,7 +189,7 @@ kill $INIT_PID; wait $INIT_PID 2>/dev/null || true
 echo "[init] Core/migrations initialized."
 
 ############################################
-# Temp PB helpers (only if not gated)
+# Temp PB helpers (only used if not gated)
 ############################################
 BOOT_PORT=8099
 start_temp() {
