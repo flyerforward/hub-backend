@@ -89,7 +89,7 @@ echo "[hooks] Wrote /app/pb_hooks/disable_collections_changes.pb.js"
 ############################################
 INIT_PORT=8097
 echo "[init] Starting PB once on :${INIT_PORT}…"
-/app/pocketbase $ENCRYPTION_ARG --dev --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
+/app/pocketbase $ENCRYPTION_ARG --dev --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_data/pb_migrations \
   serve --http 127.0.0.1:${INIT_PORT} >/tmp/pb_init.log 2>&1 &
 INIT_PID=$!
 for i in $(seq 1 120); do
@@ -105,7 +105,7 @@ echo "[init] Core/migrations initialized."
 ############################################
 BOOT_PORT=8099
 start_temp() {
-  /app/pocketbase $ENCRYPTION_ARG --dev --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
+  /app/pocketbase $ENCRYPTION_ARG --dev --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_data/pb_migrations \
     serve --http 127.0.0.1:${BOOT_PORT} >/tmp/pb_bootstrap.log 2>&1 &
   PB_PID=$!
   for i in $(seq 1 120); do
@@ -178,7 +178,7 @@ else
   wal_ckpt
 
   # Recreate env admin
-  /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
+  /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_data/pb_migrations \
     admin create "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_create.log 2>&1 || true
   cat /tmp/pb_admin_create.log || true
 
@@ -280,5 +280,5 @@ echo "[bootstrap] Done."
 # Start the real server
 ############################################
 exec /app/pocketbase $ENCRYPTION_ARG \
-  --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_migrations \
+  --dir /pb_data --hooksDir /app/pb_hooks --migrationsDir /pb_data/pb_migrations \
   serve --http 0.0.0.0:8090
