@@ -2,7 +2,7 @@
 set -euo pipefail
 [ "${PB_DEBUG:-false}" = "true" ] && set -x
 
-echo "[boot] entrypoint v9.0 (single-admin from env, enforce-only-one, settings apply, schema-locked admin UI)"
+echo "[boot] entrypoint v9.1 (single-admin from env, robust login probe, enforce-only-one, settings apply, schema-locked admin UI)"
 
 ############################################
 # Required env for admin
@@ -104,11 +104,38 @@ start_temp() {
 }
 stop_temp() { kill $PB_PID 2>/dev/null || true; wait $PB_PID 2>/dev/null || true; }
 
+# Robust auth probe: try both "admins" and "superusers" endpoints, with small retry
 auth_token() {
-  local email="$1" pw="$2"
-  local body; body="$(jq -n --arg id "$email" --arg pw "$pw" '{identity:$id, password:$pw}')"
-  curl -sS -X POST "http://127.0.0.1:${BOOT_PORT}/api/admins/auth-with-password" \
-    -H "Content-Type: application/json" --data-binary "$body" | jq -r '.token // empty'
+  local email="$1" pw="$2" host="http://127.0.0.1:${BOOT_PORT}"
+  local body resp code json token
+  body="$(jq -n --arg id "$email" --arg pw "$pw" '{identity:$id, password:$pw}')"
+
+  # helper to try one path
+  _try() {
+    local path="$1"
+    resp="$(curl -sS -w '\n%{http_code}' -X POST "$host$path" -H 'Content-Type: application/json' --data-binary "$body" || true)"
+    code="${resp##*$'\n'}"
+    json="${resp%$'\n'*}"
+    if [ "${code:-000}" -ge 200 ] && [ "${code:-000}" -lt 300 ]; then
+      token="$(printf '%s' "$json" | jq -r '.token // empty')"
+      [ -n "$token" ] && { echo "$token"; return 0; }
+    fi
+    return 1
+  }
+
+  # retry loop
+  for _i in 1 2 3 4 5; do
+    # PB <= v0.21
+    if _try "/api/admins/auth-with-password"; then return 0; fi
+    # PB >= v0.22 (superusers collection)
+    if _try "/api/collections/_superusers/auth-with-password"; then return 0; fi
+    # Some builds expose a shorthand
+    if _try "/api/superusers/auth-with-password"; then return 0; fi
+    sleep 0.5
+  done
+
+  echo ""  # signal failure
+  return 1
 }
 
 ############################################
@@ -123,17 +150,25 @@ TOKEN="$(auth_token "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" || true)"
 
 if [ -n "${TOKEN:-}" ]; then
   echo "[admin] Env admin credentials are valid."
-  # enforce single admin by deleting any others
-  sql "DELETE FROM _admins WHERE email <> '${ESC_ENV_EMAIL}';" || true
+  # enforce single admin by deleting any others (support both tables)
+  sql "DELETE FROM _admins WHERE email <> '${ESC_ENV_EMAIL}';" >/dev/null 2>&1 || true
+  sql "DELETE FROM _superusers WHERE email <> '${ESC_ENV_EMAIL}';" >/dev/null 2>&1 || true
   wal_ckpt
 else
-  echo "[admin] Env admin login failed. Recreating single admin…"
+  echo "[admin] Env admin login failed after retries. Reconciling…"
   stop_temp || true
 
-  # wipe all admins and create only the env admin
-  sql "DELETE FROM _admins;" || true
+  # Remove any non-env admins first (both tables if present)
+  sql "DELETE FROM _admins WHERE email <> '${ESC_ENV_EMAIL}';" >/dev/null 2>&1 || true
+  sql "DELETE FROM _superusers WHERE email <> '${ESC_ENV_EMAIL}';" >/dev/null 2>&1 || true
   wal_ckpt
 
+  # If an env admin exists but with wrong password, drop it so we can recreate
+  sql "DELETE FROM _admins WHERE email='${ESC_ENV_EMAIL}';" >/dev/null 2>&1 || true
+  sql "DELETE FROM _superusers WHERE email='${ESC_ENV_EMAIL}';" >/dev/null 2>&1 || true
+  wal_ckpt
+
+  # Recreate env admin
   /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
     admin create "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_create.log 2>&1 || true
   cat /tmp/pb_admin_create.log || true
@@ -147,8 +182,9 @@ else
     exit 1
   fi
 
-  # ensure single admin (there should be one now, but keep invariant)
-  sql "DELETE FROM _admins WHERE email <> '${ESC_ENV_EMAIL}';" || true
+  # Ensure invariant: single admin only
+  sql "DELETE FROM _admins WHERE email <> '${ESC_ENV_EMAIL}';" >/dev/null 2>&1 || true
+  sql "DELETE FROM _superusers WHERE email <> '${ESC_ENV_EMAIL}';" >/dev/null 2>&1 || true
   wal_ckpt
 fi
 
