@@ -226,7 +226,7 @@ if [[ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then
     STASHED=1
     echo "✓ Stashed."
   else
-    echo "Please commit/stash your changes and re-run."; exit 1
+    echo "Please commit/stash or revert your working tree changes and re-run."; exit 1
   fi
 fi
 
