@@ -22,7 +22,7 @@ if [[ ! -x "$PB_BIN" ]]; then
   if [[ -x "$REPO_ROOT/scripts/dev/get-pocketbase.sh" ]]; then
     echo "[run] Attempting auto-download..."
     bash "$REPO_ROOT/scripts/dev/get-pocketbase.sh"
-  fi 
+  fi
 fi
 
 # --- sanity checks ---
