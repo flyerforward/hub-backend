@@ -123,16 +123,13 @@ auth_token() {
     return 1
   }
 
-  # retry loop
-  for _i in 1 2 3 4 5; do
+
     # PB <= v0.21
     if _try "/api/admins/auth-with-password"; then return 0; fi
     # PB >= v0.22 (superusers collection)
     if _try "/api/collections/_superusers/auth-with-password"; then return 0; fi
     # Some builds expose a shorthand
     if _try "/api/superusers/auth-with-password"; then return 0; fi
-    sleep 0.5
-  done
 
   echo ""  # signal failure
   return 1
