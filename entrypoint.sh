@@ -104,7 +104,7 @@ start_temp() {
 }
 stop_temp() { kill $PB_PID 2>/dev/null || true; wait $PB_PID 2>/dev/null || true; }
 
-# Robust auth probe: try both "admins" and "superusers" endpoints, with small retry
+# Robust auth probe: try both "admins" and "superusers" endpoints
 auth_token() {
   local email="$1" pw="$2" host="http://127.0.0.1:${BOOT_PORT}"
   local body resp code json token
@@ -146,13 +146,13 @@ start_temp
 TOKEN="$(auth_token "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" || true)"
 
 if [ -n "${TOKEN:-}" ]; then
-  echo "[admin] Env admin credentials are valid."
+  echo "[admin] Env admin ogin success."
   # enforce single admin by deleting any others (support both tables)
   sql "DELETE FROM _admins WHERE email <> '${ESC_ENV_EMAIL}';" >/dev/null 2>&1 || true
   sql "DELETE FROM _superusers WHERE email <> '${ESC_ENV_EMAIL}';" >/dev/null 2>&1 || true
   wal_ckpt
 else
-  echo "[admin] Env admin login failed after retries. Reconciling…"
+  echo "[admin] Env admin login failed. Recreating…"
   stop_temp || true
 
   # Remove any non-env admins first (both tables if present)
