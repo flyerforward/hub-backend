@@ -43,17 +43,20 @@ PB_BACKUPS_MAX_KEEP="${PB_BACKUPS_MAX_KEEP:-7}"
 # Tools & dirs
 ############################################
 apk add --no-cache curl jq sqlite coreutils diffutils rsync >/dev/null 2>&1 || true
-mkdir -p /pb_data /app/pb_hooks
+mkdir -p /pb_data /pb_migrations /app/pb_hooks
 
-# Mirror /app/pb_migrations into /pb_data so backups include it
-mkdir -p /pb_data/pb_migrations
 if [ -d /app/pb_migrations ]; then
+  # 1) Runtime migrations (what PB actually runs)
+  rsync -a --delete /app/pb_migrations/ /pb_migrations/
+  echo "[migrations] Synced /app/pb_migrations -> /pb_migrations (runtime)"
+
+  # 2) Snapshot into pb_data so backups include the exact folder
+  mkdir -p /pb_data/pb_migrations
   rsync -a --delete /app/pb_migrations/ /pb_data/pb_migrations/
   echo "[migrations] Mirrored /app/pb_migrations -> /pb_data/pb_migrations (for backups)"
 else
   echo "[migrations] Skipped: /app/pb_migrations not found"
 fi
-
 
 sql() { sqlite3 /pb_data/data.db "$1"; }
 wal_ckpt() { sqlite3 /pb_data/data.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true; }
