@@ -124,12 +124,12 @@ auth_token() {
   }
 
 
-    # PB <= v0.21
-    if _try "/api/admins/auth-with-password"; then return 0; fi
-    # PB >= v0.22 (superusers collection)
-    if _try "/api/collections/_superusers/auth-with-password"; then return 0; fi
-    # Some builds expose a shorthand
-    if _try "/api/superusers/auth-with-password"; then return 0; fi
+  # PB <= v0.21
+  if _try "/api/admins/auth-with-password"; then return 0; fi
+  # PB >= v0.22 (superusers collection)
+  if _try "/api/collections/_superusers/auth-with-password"; then return 0; fi
+  # Some builds expose a shorthand
+  if _try "/api/superusers/auth-with-password"; then return 0; fi
 
   echo ""  # signal failure
   return 1
