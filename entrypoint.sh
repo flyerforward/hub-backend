@@ -2,10 +2,16 @@
 set -euo pipefail
 [ "${PB_DEBUG:-false}" = "true" ] && set -x
 
-echo "[boot] entrypoint v7.26 (stateless, temp-admin bootstrap, zero-admin supported) loaded"
+echo "[boot] entrypoint v9.0 (single-admin from env, enforce-only-one, settings apply, schema-locked admin UI)"
 
 ############################################
-# Env (no admin creds needed)
+# Required env for admin
+############################################
+: "${PB_ADMIN_EMAIL:?PB_ADMIN_EMAIL must be set}"
+: "${PB_ADMIN_PASSWORD:?PB_ADMIN_PASSWORD must be set}"
+
+############################################
+# Other env (no admin creds needed)
 ############################################
 PB_PUBLIC_URL="${PB_PUBLIC_URL:-http://127.0.0.1:8090}"
 PB_PUBLIC_URL="${PB_PUBLIC_URL%/}"
@@ -33,8 +39,6 @@ PB_S3_BACKUPS_FORCE_PATH_STYLE="${PB_S3_BACKUPS_FORCE_PATH_STYLE:-false}"
 PB_BACKUPS_CRON="${PB_BACKUPS_CRON:-0 3 * * *}"
 PB_BACKUPS_MAX_KEEP="${PB_BACKUPS_MAX_KEEP:-7}"
 
-
-
 ############################################
 # Tools & dirs
 ############################################
@@ -46,29 +50,27 @@ sql() { sqlite3 /pb_data/data.db "$1"; }
 wal_ckpt() { sqlite3 /pb_data/data.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true; }
 
 ############################################
-# Write the disable_collections_changes.pb.js hook file (disable collections changes for production admin UI)
+# Write schema-lock hook (disable schema ops from Admin UI)
 ############################################
 HOOK_TMP="$(mktemp)"
 cat >"$HOOK_TMP" <<'EOF'
-function deny(c) {
-  const body = { code: "schema_locked", message: "Schema/config changes are disabled in this environment." };
-  try { return c.json(body, 403); } catch (_) {}
-  try { return c.json(403, body); } catch (_) {}
-  try { if (c?.response) { c.response.status = 403; return c.response.json ? c.response.json(body) : undefined; } } catch (_) {}
-  return; // last resort
-}
-
-// --- Collections schema ops ---
-routerAdd("POST",   "/api/collections",        deny);      // create collection
-routerAdd("PATCH",  "/api/collections/:id",    deny);      // update collection
-routerAdd("DELETE", "/api/collections/:id",    deny);      // delete collection
-routerAdd("POST",   "/api/collections/import", deny);
-routerAdd("POST",   "/api/collections/export", deny);
-routerAdd("POST",   "/api/collections/truncate", deny);
+(function(){
+  function deny(c) {
+    var body = { code: "schema_locked", message: "Schema/config changes are disabled in this environment." };
+    try { return c.text(JSON.stringify(body), 403); } catch (_){}
+    try { if (c && c.response) { c.response.status = 403; } return JSON.stringify(body); } catch(_){}
+    return;
+  }
+  routerAdd("POST",   "/api/collections",           deny);
+  routerAdd("PATCH",  "/api/collections/:id",       deny);
+  routerAdd("DELETE", "/api/collections/:id",       deny);
+  routerAdd("POST",   "/api/collections/import",    deny);
+  routerAdd("POST",   "/api/collections/export",    deny);
+  routerAdd("POST",   "/api/collections/truncate",  deny);
+})();
 EOF
-# Atomic replace to avoid stale content
 mv -f "$HOOK_TMP" /app/pb_hooks/disable_collections_changes.pb.js
-echo "[hooks] Wrote /app/pb_hooks/disable_collections_changes.js"
+echo "[hooks] Wrote /app/pb_hooks/disable_collections_changes.pb.js"
 
 ############################################
 # Init core + migrations (one-time)
@@ -110,45 +112,44 @@ auth_token() {
 }
 
 ############################################
-# Track existing admins BEFORE we create temp
+# Ensure single admin from env
 ############################################
-EXISTING_COUNT="$(sql "SELECT COUNT(*) FROM _admins;" 2>/dev/null || echo 0)"
-echo "[temp-admin] Pre-existing admins: ${EXISTING_COUNT:-0}"
+ESC_ENV_EMAIL="$(printf "%s" "$PB_ADMIN_EMAIL" | sed "s/'/''/g")"
 
-############################################
-# Create temporary service admin
-############################################
-RANDHEX="$(head -c16 /dev/urandom | od -An -t x1 | tr -d ' \n')"
-TEMP_ADMIN_EMAIL="admin-${RANDHEX}@service.local"
-TEMP_ADMIN_PASSWORD="$(head -c24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c32)"
-ESC_TEMP_EMAIL="$(printf "%s" "$TEMP_ADMIN_EMAIL" | sed "s/'/''/g")"
-
-# Collision check (ultra unlikely)
-EXISTS="$(sql "SELECT COUNT(*) FROM _admins WHERE email='${ESC_TEMP_EMAIL}';" 2>/dev/null || echo 0)"
-if [ "${EXISTS:-0}" -gt 0 ]; then
-  RANDHEX="$(head -c16 /dev/urandom | od -An -t x1 | tr -d ' \n')"
-  TEMP_ADMIN_EMAIL="admin-${RANDHEX}@service.local"
-  TEMP_ADMIN_PASSWORD="$(head -c24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c32)"
-  ESC_TEMP_EMAIL="$(printf "%s" "$TEMP_ADMIN_EMAIL" | sed "s/'/''/g")"
-fi
-
-echo "[temp-admin] Creating temporary admin: $TEMP_ADMIN_EMAIL"
-/app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-  admin create "$TEMP_ADMIN_EMAIL" "$TEMP_ADMIN_PASSWORD" >/tmp/pb_admin_create.log 2>&1 || true
-cat /tmp/pb_admin_create.log || true
-
-echo "[bootstrap] Starting temp PB for settings apply…"
+echo "[admin] Enforcing single admin: $PB_ADMIN_EMAIL"
 start_temp
 
-ADMIN_TOKEN="$(auth_token "$TEMP_ADMIN_EMAIL" "$TEMP_ADMIN_PASSWORD")"
-if [ -z "$ADMIN_TOKEN" ]; then
-  echo "[temp-admin] ERROR: could not authenticate temp admin."
-  tail -n 200 /tmp/pb_bootstrap.log || true
-  stop_temp
-  # best-effort cleanup via SQL (in case it's the only admin)
-  sql "DELETE FROM _admins WHERE email='${ESC_TEMP_EMAIL}';" || true
+TOKEN="$(auth_token "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" || true)"
+
+if [ -n "${TOKEN:-}" ]; then
+  echo "[admin] Env admin credentials are valid."
+  # enforce single admin by deleting any others
+  sql "DELETE FROM _admins WHERE email <> '${ESC_ENV_EMAIL}';" || true
   wal_ckpt
-  exit 1
+else
+  echo "[admin] Env admin login failed. Recreating single admin…"
+  stop_temp || true
+
+  # wipe all admins and create only the env admin
+  sql "DELETE FROM _admins;" || true
+  wal_ckpt
+
+  /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
+    admin create "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" >/tmp/pb_admin_create.log 2>&1 || true
+  cat /tmp/pb_admin_create.log || true
+
+  # bring PB back to get a token
+  start_temp
+  TOKEN="$(auth_token "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" || true)"
+  if [ -z "${TOKEN:-}" ]; then
+    echo "[admin] ERROR: could not authenticate env admin after recreation."
+    tail -n 200 /tmp/pb_bootstrap.log || true
+    exit 1
+  fi
+
+  # ensure single admin (there should be one now, but keep invariant)
+  sql "DELETE FROM _admins WHERE email <> '${ESC_ENV_EMAIL}';" || true
+  wal_ckpt
 fi
 
 ############################################
@@ -196,7 +197,7 @@ jq -s 'add' "$META_FILE" "$STOR_FILE" "$BACK_FILE" > "$DESIRED_FILE"
 jq '{meta:{appUrl:.meta.appUrl}, s3, backups}' "$DESIRED_FILE" | jq -S . > "$DESIRED_TRIM_FILE"
 
 # live → same shape
-curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" \
+curl -fsS -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:${BOOT_PORT}/api/settings" > "$LIVE_FILE"
 jq '{meta:{appUrl:.meta.appUrl}, s3, backups}' "$LIVE_FILE" | jq -S . > "$LIVE_TRIM_FILE"
 
@@ -206,21 +207,13 @@ if ! diff -q "$DESIRED_TRIM_FILE" "$LIVE_TRIM_FILE" >/dev/null 2>&1; then
   PATCH_OUT="$(mktemp)"; PATCH_CODE=0
   cat "$DESIRED_FILE" | curl -sS -w "%{http_code}" -o "$PATCH_OUT" \
     -X PATCH "http://127.0.0.1:${BOOT_PORT}/api/settings" \
-    -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
     --data-binary @- > /tmp/pb_patch_code.txt || PATCH_CODE=$?
   HTTP_CODE="$(cat /tmp/pb_patch_code.txt || echo 000)"
   if [ "$PATCH_CODE" -ne 0 ] || [ "$HTTP_CODE" -ge 400 ]; then
     echo "[settings] PATCH failed (HTTP $HTTP_CODE). Response:"; cat "$PATCH_OUT"
     echo "--- bootstrap.log (tail) ---"; tail -n 200 /tmp/pb_bootstrap.log || true
     stop_temp
-    # clean up temp admin safely (use SQL if it's the only one)
-    if [ "${EXISTING_COUNT:-0}" -gt 0 ]; then
-      /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-        admin delete "$TEMP_ADMIN_EMAIL" >/tmp/pb_admin_delete.log 2>&1 || true
-    else
-      sql "DELETE FROM _admins WHERE email='${ESC_TEMP_EMAIL}';" || true
-      wal_ckpt
-    fi
     exit 1
   fi
 else
@@ -232,19 +225,9 @@ rm -f "$META_FILE" "$STOR_FILE" "$BACK_FILE" "$DESIRED_FILE" "$DESIRED_TRIM_FILE
       "$LIVE_FILE" "$LIVE_TRIM_FILE" /tmp/pb_patch_code.txt 2>/dev/null || true
 
 ############################################
-# Tear down temp PB and remove temp admin
+# Stop temp PB (do NOT delete env admin)
 ############################################
 stop_temp
-if [ "${EXISTING_COUNT:-0}" -gt 0 ]; then
-  echo "[temp-admin] Deleting temporary admin via CLI (other admins exist)."
-  /app/pocketbase $ENCRYPTION_ARG --dir /pb_data --migrationsDir /pb_migrations \
-    admin delete "$TEMP_ADMIN_EMAIL" >/tmp/pb_admin_delete.log 2>&1 || true
-  cat /tmp/pb_admin_delete.log || true
-else
-  echo "[temp-admin] Removing the only admin via direct SQL to leave zero-admin state."
-  sql "DELETE FROM _admins WHERE email='${ESC_TEMP_EMAIL}';" || true
-  wal_ckpt
-fi
 
 echo "[bootstrap] Done."
 
