@@ -146,7 +146,7 @@ start_temp
 TOKEN="$(auth_token "$PB_ADMIN_EMAIL" "$PB_ADMIN_PASSWORD" || true)"
 
 if [ -n "${TOKEN:-}" ]; then
-  echo "[admin] Env admin ogin success."
+  echo "[admin] Env admin login success."
   # enforce single admin by deleting any others (support both tables)
   sql "DELETE FROM _admins WHERE email <> '${ESC_ENV_EMAIL}';" >/dev/null 2>&1 || true
   sql "DELETE FROM _superusers WHERE email <> '${ESC_ENV_EMAIL}';" >/dev/null 2>&1 || true
